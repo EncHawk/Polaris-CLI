@@ -16,6 +16,12 @@ import {
 } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import { searchId, searchTitle } from "../tools/arxiv.ts";
+import {
+  searchPolarisPapers,
+  getImplementation,
+  getImplementationFile,
+  arxivIdToRepoName,
+} from "../tools/papers.ts";
 import { runOne } from "../pipeline/run.ts";
 import { getSettings } from "../config/settings.ts";
 
@@ -28,7 +34,7 @@ export interface McpServerOptions {
 export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
   const server = new McpServer(SERVER_INFO, {
     instructions:
-      "Polaris AI paper-reproduction pipeline. Agents call complete_* / mark_implementation_complete to submit structured output, and search_arxiv to look up citations. External agents call polaris_run to reproduce an arXiv paper end-to-end.",
+      "Polaris AI paper-reproduction pipeline. Agents call complete_* / mark_implementation_complete to submit structured output, search_arxiv to look up citation metadata, and search_polaris_papers / get_polaris_implementation to retrieve an existing coded reproduction from the PolarisAI-Implementations library. External agents call polaris_run to reproduce an arXiv paper end-to-end.",
   });
 
   // ─── Completion signal tools (args carry the structured output) ──────────────
@@ -139,16 +145,135 @@ export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
     },
   );
 
+  // ─── Polaris coded-implementation library (Phase 2) ──────────────────────────
+  // Lets coding agents retrieve the right coded paper reproduction from the
+  // PolarisAI-Implementations GitHub org based on what they're asking for.
+  server.registerTool(
+    "search_polaris_papers",
+    {
+      description:
+        "Search the Polaris coded-implementation library (github.com/" +
+        getSettings().POLARIS_PAPERS_ORG +
+        ") for an existing reproduction of a paper. " +
+        "Pass arxiv_id for a direct lookup, or a free-text query (topic/keyword) to rank all implementations. " +
+        "Returns matching repos with their arXiv id, description, and GitHub URL. " +
+        "Use this to discover whether a paper (or a citation it builds on) already has a coded implementation you can reuse.",
+      inputSchema: {
+        arxiv_id: z
+          .string()
+          .optional()
+          .describe("ArXiv ID to look up directly, e.g. 2106.09685"),
+        query: z
+          .string()
+          .optional()
+          .describe("Free-text search over repo names and descriptions (e.g. 'attention transformer', 'lora finetuning')"),
+        limit: z.number().optional().describe("Max results (default 10)"),
+      },
+    },
+    async (args) => {
+      try {
+        const matches = await searchPolarisPapers({
+          arxiv_id: args.arxiv_id,
+          query: args.query,
+          limit: args.limit,
+        });
+        if (matches.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  found: 0,
+                  org: getSettings().POLARIS_PAPERS_ORG,
+                  message: "No coded implementations matched. The paper may not have been reproduced yet.",
+                }),
+              },
+            ],
+          };
+        }
+        const summary = matches.map((m) => ({
+          arxiv_id: m.arxiv_id,
+          repo_name: m.repo_name,
+          description: m.description,
+          html_url: m.html_url,
+          updated_at: m.updated_at,
+          stars: m.stars,
+        }));
+        return { content: [{ type: "text", text: JSON.stringify({ found: matches.length, papers: summary }) }] };
+      } catch (e) {
+        return { isError: true, content: [{ type: "text", text: `search_polaris_papers failed: ${(e as Error).message}` }] };
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_polaris_implementation",
+    {
+      description:
+        "Retrieve the full coded implementation for a paper from the Polaris library. " +
+        "Returns the file tree plus the contents of every source/code file. " +
+        "Pass arxiv_id or repo_name. Use single_file to fetch just one file path instead of the whole repo.",
+      inputSchema: {
+        arxiv_id: z
+          .string()
+          .optional()
+          .describe("ArXiv ID of the paper whose implementation to retrieve, e.g. 2106.09685"),
+        repo_name: z
+          .string()
+          .optional()
+          .describe("Repo name directly, e.g. paper-2106-09685"),
+        single_file: z
+          .string()
+          .optional()
+          .describe("If set, return only this single file path's contents instead of the whole repo"),
+        max_files: z
+          .number()
+          .optional()
+          .describe("Max number of file bodies to fetch when retrieving the whole repo (default 40)"),
+      },
+    },
+    async (args) => {
+      const s = getSettings();
+      try {
+        const repoName = args.repo_name || (args.arxiv_id ? arxivIdToRepoName(args.arxiv_id) : "");
+        if (!repoName) {
+          return { isError: true, content: [{ type: "text", text: "Provide either arxiv_id or repo_name." }] };
+        }
+        if (args.single_file) {
+          const content = await getImplementationFile(repoName, args.single_file);
+          return { content: [{ type: "text", text: JSON.stringify({ repo_name: repoName, path: args.single_file, content }) }] };
+        }
+        const impl = await getImplementation(repoName, args.max_files);
+        return { content: [{ type: "text", text: JSON.stringify(impl) }] };
+      } catch (e) {
+        return { isError: true, content: [{ type: "text", text: `get_polaris_implementation failed: ${(e as Error).message}` }] };
+      }
+    },
+  );
+
   // ─── Full pipeline (for external coding agents: claude-code, codex, …) ───────
   server.registerTool(
     "polaris_run",
     {
       description:
-        "Run the full Polaris paper-reproduction pipeline (READ -> RESEARCH -> PLAN -> CODE) for an arXiv paper. " +
-        "Returns the final status and GitHub URL. Auto-approves the plan (non-interactive). " +
-        "Requires POLARIS_API_KEY (BYOK) to be configured on the polaris CLI host.",
+        "Run the full Polaris paper-reproduction pipeline (READ -> RESEARCH -> PLAN -> CODE) for an arXiv paper or an uploaded paper's text. " +
+        "First checks the Polaris coded-implementation library for an existing reproduction; if found and reuse_if_exists=true, returns the existing repo. " +
+        "Otherwise generates the code with the BYOK LLM (or trueForge harness) and pushes it to GitHub. " +
+        "Auto-approves the plan (non-interactive). Requires POLARIS_API_KEY (BYOK) on the polaris CLI host.",
       inputSchema: {
-        arxiv_id: z.string().describe("ArXiv paper id, e.g. 2301.12345"),
+        arxiv_id: z.string().optional().describe("ArXiv paper id, e.g. 2301.12345 (required if markdown is not given)"),
+        markdown: z
+          .string()
+          .optional()
+          .describe("Paper text as markdown (e.g. extracted from an uploaded PDF). Pass this instead of arxiv_id to reproduce a paper from its file contents."),
+        engine: z
+          .enum(["local", "trueforge"])
+          .optional()
+          .describe("local (default) = BYOK ReAct agents; trueforge = run via the trueForge harness"),
+        reuse_if_exists: z
+          .boolean()
+          .optional()
+          .describe("If true and an existing coded implementation is found in the library, reuse it instead of regenerating (default false)"),
         repo_name: z.string().optional().describe("Optional target GitHub repo name"),
         execution_mode: z
           .enum(["create", "modify", "run"])
@@ -165,19 +290,27 @@ export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
           content: [{ type: "text", text: "POLARIS_API_KEY is not set on the polaris host (BYOK required)." }],
         };
       }
+      if (!args.arxiv_id && !args.markdown) {
+        return { isError: true, content: [{ type: "text", text: "Provide either arxiv_id or markdown." }] };
+      }
       try {
         const final = await runOne({
           arxiv_id: args.arxiv_id,
+          markdown: args.markdown,
+          engine: args.engine ?? "local",
+          reuse_if_exists: args.reuse_if_exists ?? false,
           repo_name: args.repo_name,
           execution_mode: args.execution_mode,
           top_n_citations: args.top_n_citations,
           auto_approve: true,
         });
         const code = final.code ?? {};
+        const reused = Boolean(final.library_hit && (final.status === "done") && !code.files?.length);
         const text =
-          `status: ${final.status ?? "done"}\n` +
+          `status: ${final.status ?? "done"}${reused ? " (reused existing)" : ""}\n` +
           `github_url: ${code.github_url ?? ""}\n` +
           `repo_name: ${code.repo_name ?? ""}\n` +
+          (final.library_hit ? `library_hit: ${final.library_hit.repo_name}\n` : "") +
           (code.push_error ? `push_error: ${code.push_error}\n` : "") +
           (final.error ? `error: ${final.error}\n` : "") +
           `files: ${(code.files ?? []).map((f) => f.path).join(", ")}`;

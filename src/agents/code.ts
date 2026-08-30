@@ -2,17 +2,18 @@ import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
 import type { WorkerState, CodeOutput, CodeFile, RunLog } from "../state.ts";
 import { markAgentRun } from "../state.ts";
 import { status, step, output } from "../pipeline/trace.ts";
-import { runAgenticCall } from "../agents_util/loop.ts";
+import { runAgentTurn } from "../agents_util/engine.ts";
 import { chatCompletion } from "../agents_util/llm.ts";
 import { getSettings } from "../config/settings.ts";
-import { Sandbox } from "../tools/sandbox.ts";
+import { Workspace } from "../tools/workspace.ts";
 import { GitHubRepository } from "../tools/github.ts";
 import { saveCodeCheckpoint, loadLatestCheckpoint, deleteCheckpoints } from "../agents_util/checkpoint.ts";
+import { implementationRepoName } from "../tools/upload.ts";
 
 export const CODE_SYSTEM_PROMPT = `You are the CODE agent for an automated paper-reproduction pipeline.
 Implement the paper's claim in PyTorch (or raw Python where the paper specifies).
 
-You have access to a sandboxed Linux environment with Python and common ML libraries.
+You write files directly to a project directory on the user's filesystem. Python and common ML libraries are available.
 
 Rules:
 1. Implement files ONE AT A TIME following the plan order.
@@ -25,10 +26,10 @@ Rules:
 8. When all files are implemented and working, call mark_implementation_complete.
 
 Available tools:
-- write_file: Write a file to the sandbox workspace (provide file_path and content)
-- read_file: Read a file from the sandbox workspace
-- run_command: Run a shell command in the sandbox (provide command, optional timeout)
-- list_files: List files in the sandbox workspace (optional directory filter)
+- write_file: Write a file to the project directory (provide file_path and content)
+- read_file: Read a file from the project directory
+- run_command: Run a shell command in the project directory (provide command, optional timeout)
+- list_files: List files in the workspace workspace (optional directory filter)
 - mark_implementation_complete: Call this when the implementation is done and working
 
 Start by understanding the plan, then implement files one by one.`;
@@ -38,7 +39,7 @@ export const CODE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "write_file",
-      description: "Write a file to the sandbox workspace. Creates parent directories automatically.",
+      description: "Write a file to the workspace workspace. Creates parent directories automatically.",
       parameters: {
         type: "object",
         properties: {
@@ -53,7 +54,7 @@ export const CODE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read a file from the sandbox workspace.",
+      description: "Read a file from the workspace workspace.",
       parameters: {
         type: "object",
         properties: {
@@ -67,7 +68,7 @@ export const CODE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "run_command",
-      description: "Run a shell command in the sandbox. Returns stdout + stderr + return code.",
+      description: "Run a shell command in the workspace. Returns stdout + stderr + return code.",
       parameters: {
         type: "object",
         properties: {
@@ -82,7 +83,7 @@ export const CODE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "list_files",
-      description: "List files in the sandbox workspace directory.",
+      description: "List files in the workspace workspace directory.",
       parameters: {
         type: "object",
         properties: {
@@ -160,10 +161,13 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     null, 2,
   ).slice(0, 4000);
 
-  const sandbox = Sandbox.create(jobUuid);
+  const workspace = Workspace.create(
+    state.repo_name || implementationRepoName(state.arxiv_id ?? "", `paper-${state.arxiv_id ?? "unknown"}`),
+    state.output_dir,
+  );
   const hasGithub = !!s.GITHUB_ACCESS_TOKEN;
   const repo = hasGithub ? new GitHubRepository() : null;
-  const repoName = state.repo_name || `paper-${state.arxiv_id ?? "unknown"}`;
+  const repoName = state.repo_name || implementationRepoName(state.arxiv_id ?? "", `paper-${state.arxiv_id ?? "unknown"}`);
   const executionMode = state.execution_mode ?? "create";
   const existing = !!state.repo_exists || executionMode === "modify" || executionMode === "run";
   let githubUrl = state.github_url || (repo ? repo.htmlUrl(repoName) : "");
@@ -174,9 +178,9 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     try {
       const remote = await repo.ensure(repoName);
       githubUrl = remote.html_url || githubUrl;
-      const prepared = await sandbox.prepareGit(remote.clone_url, remote.token, true);
+      const prepared = await workspace.prepareGit(remote.clone_url, remote.token, true);
       step(jobUuid, "CODE", "repo-checkout", {
-        tool: "github+sandbox",
+        tool: "github+workspace",
         conclusion: `checked out ${repoName} rc=${prepared.returncode}`,
         output_query: githubUrl,
       });
@@ -195,14 +199,13 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   }
 
   if (executionMode === "run") {
-    const runResult = await sandbox.exec("python reproduce.py");
+    const runResult = await workspace.exec("python reproduce.py");
     step(jobUuid, "CODE", "run-existing-repo", {
-      tool: "sandbox",
+      tool: "workspace",
       conclusion: `rc=${runResult.returncode} ${runResult.stderr.slice(0, 160) || runResult.stdout.slice(0, 160)}`,
       output_query: "python reproduce.py",
     });
     output(jobUuid, "CODE", `existing repo run rc=${runResult.returncode}`, githubUrl);
-    sandbox.cleanup();
     return {
       code: {
         files: [],
@@ -222,7 +225,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   let checkpointContext = "";
   if (checkpoint) {
     for (const [path, content] of Object.entries(checkpoint)) {
-      sandbox.writeFile(path, content);
+      workspace.writeFile(path, content);
       step(jobUuid, "CODE", "checkpoint-restore", {
         tool: "checkpoint",
         conclusion: `restored ${path} from checkpoint`,
@@ -239,7 +242,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     write_file: async (args: ToolArgs) => {
       const path = String(args["file_path"] ?? "");
       const content = String(args["content"] ?? "");
-      sandbox.writeFile(path, content);
+      workspace.writeFile(path, content);
       codeFiles.push({ path, contents: content });
       const allFiles: Record<string, string> = {};
       for (const f of codeFiles) allFiles[f.path] = f.contents;
@@ -249,7 +252,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     read_file: async (args: ToolArgs) => {
       const path = String(args["file_path"] ?? "");
       try {
-        return await sandbox.readFile(path);
+        return await workspace.readFile(path);
       } catch (e) {
         return `Error reading ${path}: ${(e as Error).message}`;
       }
@@ -257,7 +260,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     run_command: async (args: ToolArgs) => {
       const cmd = String(args["command"] ?? "");
       const timeout = Number(args["timeout"] ?? 120);
-      const r = await sandbox.exec(cmd, timeout);
+      const r = await workspace.exec(cmd, timeout);
       const log: RunLog = {
         step: `run-${accumulatedLogs.length + 1}`,
         stdout: r.stdout.slice(0, 3000),
@@ -268,7 +271,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     },
     list_files: async (args: ToolArgs) => {
       const directory = String(args["directory"] ?? ".");
-      return await sandbox.listFiles(directory);
+      return await workspace.listFiles(directory);
     },
     mark_implementation_complete: async (args: ToolArgs) => {
       data = args;
@@ -290,7 +293,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     });
   }
 
-  await runAgenticCall({
+  const result = await runAgentTurn({
     agentName: "CODE",
     systemPrompt: CODE_SYSTEM_PROMPT,
     userMessage,
@@ -300,7 +303,9 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     agentEnum: "CODE",
     maxTokens: s.AGENT_MAX_STEPS * 8192,
     conversationHistory,
+    engine: (state.engine as "local" | "trueforge") ?? "local",
   });
+  data = result.structured;
 
   if (codeFiles.length === 0) {
     pushError = "code produced no output";
@@ -308,7 +313,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     const paths = new Set(codeFiles.map((f) => f.path));
     if (!paths.has("README.md")) {
       const readme = await generateReadme(state.arxiv_id ?? "", repoName, codeFiles);
-      sandbox.writeFile("README.md", readme);
+      workspace.writeFile("README.md", readme);
       codeFiles.push({ path: "README.md", contents: readme });
       step(jobUuid, "CODE", "readme-injected", {
         tool: "llm:BYOK(OpenAI-compatible)",
@@ -321,13 +326,13 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
         const remote = await repo.ensure(repoName, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
         githubUrl = remote.html_url || githubUrl;
         if (!existing) {
-          const prepared = await sandbox.prepareGit(remote.clone_url, remote.token, false);
+          const prepared = await workspace.prepareGit(remote.clone_url, remote.token, false);
           if (prepared.returncode !== 0) pushError = prepared.stderr || prepared.stdout || "repo initialization failed";
         }
         if (!pushError) {
-          const pushed = await sandbox.publishGit(remote.token, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
+          const pushed = await workspace.publishGit(remote.token, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
           step(jobUuid, "CODE", "repo-push", {
-            tool: "github+sandbox",
+            tool: "github+workspace",
             conclusion: `pushed ${repoName} rc=${pushed.returncode}`,
             output_query: githubUrl,
           });
@@ -336,7 +341,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
       } catch (e) {
         pushError = `repo publish failed: ${(e as Error).message}`;
         step(jobUuid, "CODE", "repo-push-failed", {
-          tool: "github+sandbox",
+          tool: "github+workspace",
           conclusion: pushError,
           output_query: githubUrl,
         });
@@ -345,7 +350,6 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   }
 
   deleteCheckpoints(jobUuid);
-  sandbox.cleanup();
 
   const d = (data ?? {}) as Record<string, unknown>;
   const code: CodeOutput = {

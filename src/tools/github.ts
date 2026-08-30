@@ -28,7 +28,7 @@ export class GitHubRepository {
     const s = getSettings();
     if (!s.GITHUB_ACCESS_TOKEN) throw new Error("GITHUB_ACCESS_TOKEN is not configured");
     this.token = s.GITHUB_ACCESS_TOKEN;
-    this.org = s.GITHUB_ORG;
+    this.org = s.POLARIS_PUBLISH_ORG || s.GITHUB_ORG;
     this.baseUrl = s.GITHUB_API_URL.replace(/\/$/, "");
     this.headers = {
       Accept: "application/vnd.github+json",

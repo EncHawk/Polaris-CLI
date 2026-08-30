@@ -18,6 +18,7 @@ import { makeTrueForgeClient } from "../trueforge/client.ts";
 import { isTrueForgeRunning } from "../trueforge/server.ts";
 import { provisionTrueForge } from "../trueforge/provision.ts";
 import { POLARIS_AGENT_NAMES, polarisAgentSpecs } from "../trueforge/agents.ts";
+import { extractPaperFile } from "../tools/upload.ts";
 
 const HELP = `Polaris AI CLI — BYOK paper-reproduction agent harness (powered by trueForge)
 
@@ -25,10 +26,15 @@ USAGE
   polaris <command> [args]
 
 COMMANDS
-  run <arxiv-id> [--auto] [--repo <name>] [--mode create|modify|run]
+  run <arxiv-id> [--auto] [--file <path>] [--engine local|trueforge]
+                    [--reuse] [--output <dir>] [--repo <name>] [--mode create|modify|run]
                                   Run the pipeline (interactive TUI)
-  serve [--tf] [--port <n>]       Start agent-server (web + API + MCP)
-                                    --tf  also boot + provision trueForge
+                                    --file     read a PDF/markdown/tex file instead of fetching by arxiv id
+                                    --engine   local (BYOK ReAct loop, default) | trueforge (harness)
+                                    --reuse    if an existing coded implementation is found in the library, reuse it
+                                    --output   directory to create the project in (default: cwd)
+  serve [--tf] [--port <n>]       Start agent-server (web + API + MCP + uploads)
+                                     --tf  also boot + provision trueForge
   mcp                             Run the polaris MCP server over stdio
   setup [--base-url <url>]        Provision a trueForge server (BYOK model + MCP + agents)
   agent list [--base-url <url>]   List trueForge agents
@@ -37,6 +43,7 @@ COMMANDS
 
 ENV  (see .env.example)
   POLARIS_API_KEY, POLARIS_BASE_URL, POLARIS_DEFAULT_MODEL  (BYOK LLM)
+  POLARIS_PAPERS_ORG, POLARIS_PUBLISH_ORG                   (library + publish targets)
   POLARIS_TRUEFORGE_PORT, POLARIS_TRUEFORGE_BASE_URL        (harness)
   GITHUB_ACCESS_TOKEN, DAYTONA_API_KEY                      (optional)
 `;
@@ -77,14 +84,43 @@ function hasFlag(rest: string[], name: string): boolean {
 
 async function cmdRun(rest: string[]): Promise<void> {
   const arxivId = rest.find((a) => !a.startsWith("-"));
-  if (!arxivId) {
-    console.error("Usage: polaris run <arxiv-id> [--auto] [--repo <name>] [--mode create|modify|run]");
-    process.exit(1);
-  }
   const auto = hasFlag(rest, "--auto");
+  const file = flag(rest, "--file");
+  const engine = flag(rest, "--engine") ?? "local";
+  const reuse = hasFlag(rest, "--reuse");
+  const output = flag(rest, "--output");
   const repo = flag(rest, "--repo");
   const mode = flag(rest, "--mode");
-  await runTui({ arxiv_id: arxivId, repo_name: repo, execution_mode: mode, auto_approve: auto });
+
+  if (!arxivId && !file) {
+    console.error("Usage: polaris run <arxiv-id> [--auto] [--file <path>] [--engine local|trueforge] [--reuse] [--output <dir>] [--repo <name>] [--mode create|modify|run]");
+    process.exit(1);
+  }
+
+  let markdown: string | undefined;
+  let resolvedArxivId = arxivId;
+  if (file) {
+    console.log(`${DIM}Extracting text from ${file}…${RESET}`);
+    const result = await extractPaperFile(file);
+    markdown = result.markdown;
+    if (!resolvedArxivId && result.arxiv_id) resolvedArxivId = result.arxiv_id;
+    console.log(`${DIM}  ${result.kind} · ${result.pages} page(s) · ${result.chars} chars · arxiv ${result.arxiv_id || "(none)"}${RESET}`);
+    if (!markdown) {
+      console.error(`${RED}Could not extract text from ${file}${RESET}`);
+      process.exit(1);
+    }
+  }
+
+  await runTui({
+    arxiv_id: resolvedArxivId,
+    markdown,
+    engine,
+    reuse_if_exists: reuse,
+    output_dir: output,
+    repo_name: repo,
+    execution_mode: mode,
+    auto_approve: auto,
+  });
 }
 
 async function cmdServe(rest: string[]): Promise<void> {
@@ -185,9 +221,9 @@ async function cmdDoctor(rest: string[]): Promise<void> {
   const ghOk = !!s.GITHUB_ACCESS_TOKEN;
   console.log(`  ${ghOk ? GREEN + "✓" : YELLOW + "○"}${RESET} GitHub publishing ${DIM}(optional)${RESET}`);
 
-  // Daytona
-  const dayOk = !!s.DAYTONA_API_KEY;
-  console.log(`  ${dayOk ? GREEN + "✓" : YELLOW + "○"}${RESET} Daytona sandbox ${DIM}(optional, local tempdir fallback)${RESET}`);
+  // Output dir
+  const outDir = s.POLARIS_OUTPUT_DIR || process.cwd();
+  console.log(`  ${GREEN}✓${RESET} Output directory ${DIM}${outDir}${RESET}`);
 
   // trueForge
   const tfBaseUrl = s.TRUEFORGE_BASE_URL ?? `http://localhost:${s.TRUEFORGE_PORT}`;
@@ -196,6 +232,14 @@ async function cmdDoctor(rest: string[]): Promise<void> {
 
   // MCP server
   console.log(`  ${GREEN}✓${RESET} MCP server available ${DIM}(polaris mcp / polaris serve)${RESET}`);
+
+  // Paper library
+  const papersOrg = s.POLARIS_PAPERS_ORG;
+  const papersAuth = s.POLARIS_PAPERS_TOKEN ? `${GREEN}✓${RESET}` : `${YELLOW}○${RESET}`;
+  console.log(`  ${papersAuth} Paper library ${DIM}github.com/${papersOrg} (search/get_polaris_implementation MCP tools)${RESET}`);
+  if (!s.POLARIS_PAPERS_TOKEN) {
+    console.log(`    ${DIM}anonymous GitHub rate-limited — set GITHUB_ACCESS_TOKEN for reliable library search${RESET}`);
+  }
 
   const allOk = llmOk;
   console.log(`\n  ${allOk ? GREEN + BOLD + "Ready." : RED + BOLD + "Missing BYOK LLM key — set POLARIS_API_KEY in .env"}${RESET}\n`);

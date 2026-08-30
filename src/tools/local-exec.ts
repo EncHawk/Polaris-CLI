@@ -1,7 +1,7 @@
-/** Shell exec for the local sandbox fallback — runs `bash -c <cmd>` in a cwd. */
-import type { SandboxResult } from "./sandbox.ts";
+/** Shell exec for the workspace — runs `bash -c <cmd>` in a cwd. */
+import type { ExecResult } from "./workspace.ts";
 
-export async function exec(cmd: string, cwd: string, timeoutSec = 600): Promise<SandboxResult> {
+export async function exec(cmd: string, cwd: string, timeoutSec = 600): Promise<ExecResult> {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(["bash", "-c", cmd], { cwd, stdout: "pipe", stderr: "pipe" });

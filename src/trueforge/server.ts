@@ -5,11 +5,24 @@
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { createRequire } from "node:module";
 import { getSettings } from "../config/settings.ts";
 
-const PROJECT_ROOT = join(import.meta.dir, "../..");
-const BIN = join(PROJECT_ROOT, "node_modules", ".bin", "trueforge");
 const LOG_DIR = join(homedir(), ".polaris");
+
+// Resolve the bundled trueForge CLI through Node module resolution so it works
+// no matter how polaris-cli was installed (local, global, or with hoisted
+// deps). Spawning `<pkg>/node_modules/.bin/trueforge` directly breaks under
+// npm hoisting and global installs because the .bin symlink lives at the
+// install root, not inside the package.
+const TRUEFORGE_CLI: string | null = (() => {
+  try {
+    const require = createRequire(import.meta.url);
+    return require.resolve("@truefoundry/trueforge/dist/cli.js");
+  } catch {
+    return null;
+  }
+})();
 
 export interface TrueForgeServer {
   baseUrl: string;
@@ -35,8 +48,15 @@ export async function startTrueForgeServer(overrides: { port?: number; sqlitePat
     PUBLIC_BASE_URL: `http://localhost:${port}`,
   };
 
-  const proc = Bun.spawn([BIN], {
-    cwd: PROJECT_ROOT,
+  if (!TRUEFORGE_CLI) {
+    throw new Error(
+      "trueForge CLI not found — @truefoundry/trueforge is not installed. Run `bun add @truefoundry/trueforge`.",
+    );
+  }
+  // Run trueForge from the polaris data dir (not the package install dir) so a
+  // global/npm install doesn't write runtime files into node_modules.
+  const proc = Bun.spawn([TRUEFORGE_CLI], {
+    cwd: LOG_DIR,
     env,
     stdout: Bun.file(logPath()),
     stderr: Bun.file(logPath()),
