@@ -41,23 +41,48 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const port = opts.port ?? s.POLARIS_PORT;
   const mcpSecret = opts.mcpSecret ?? Bun.env["POLARIS_MCP_SECRET"];
 
-  // Optionally boot + provision a local trueForge harness alongside the server.
-  // trueForge runs on its own port (POLARIS_TRUEFORGE_PORT, default 8790) so it
-  // never collides with the agent-server port; the polaris MCP that the
-  // trueForge agents route to is OUR server's /mcp route.
+  // Optionally boot + provision a trueForge harness alongside the server.
+  // A configured remote harness (POLARIS_TRUEFORGE_BASE_URL) must already be
+  // running and is only (re)provisioned when an externally reachable MCP URL
+  // (POLARIS_MCP_PUBLIC_URL) is set — a localhost MCP URL would resolve on the
+  // remote host. A locally managed harness runs on POLARIS_TRUEFORGE_PORT (so
+  // it never collides with the agent-server port) and is provisioned with our
+  // own /mcp route.
   if (opts.startTrueForge) {
-    const tfPort = s.TRUEFORGE_PORT;
-    const tfUrl = `http://localhost:${tfPort}`;
-    const running = await isTrueForgeRunning(tfUrl);
-    if (!running) {
-      console.log(`[polaris] starting local trueForge harness on :${tfPort} …`);
-      tfServer = await startTrueForgeServer({ port: tfPort });
+    if (s.TRUEFORGE_BASE_URL) {
+      const remoteUrl = s.TRUEFORGE_BASE_URL;
+      if (!(await isTrueForgeRunning(remoteUrl))) {
+        throw new Error(
+          `trueForge is not reachable at ${remoteUrl} — start it (npx @truefoundry/trueforge) ` +
+            `or unset POLARIS_TRUEFORGE_BASE_URL so polaris can boot one locally.`,
+        );
+      }
+      if (s.POLARIS_MCP_PUBLIC_URL) {
+        console.log(`[polaris] provisioning remote trueForge at ${remoteUrl} (MCP → ${s.POLARIS_MCP_PUBLIC_URL}) …`);
+        await provisionTrueForge(makeTrueForgeClient(remoteUrl), {
+          mcpUrl: s.POLARIS_MCP_PUBLIC_URL,
+          mcpSecret,
+        });
+      } else {
+        console.log(
+          `[polaris] using remote trueForge at ${remoteUrl} as provisioned ` +
+            `(set POLARIS_MCP_PUBLIC_URL to an externally reachable polaris MCP URL to re-provision)`,
+        );
+      }
+    } else {
+      const tfPort = s.TRUEFORGE_PORT;
+      const localTf = `http://localhost:${tfPort}`;
+      const running = await isTrueForgeRunning(localTf);
+      if (!running) {
+        console.log(`[polaris] starting local trueForge harness on :${tfPort} …`);
+        tfServer = await startTrueForgeServer({ port: tfPort });
+      }
+      const client = makeTrueForgeClient(localTf);
+      const mcpUrl = `http://localhost:${port}/mcp`;
+      console.log(`[polaris] provisioning trueForge (model provider + MCP → ${mcpUrl} + agents) …`);
+      await provisionTrueForge(client, { mcpUrl, mcpSecret });
+      console.log(`[polaris] trueForge ready at ${tfServer?.baseUrl ?? localTf} (chat UI + API)`);
     }
-    const client = makeTrueForgeClient(tfUrl);
-    const mcpUrl = `http://localhost:${port}/mcp`;
-    console.log(`[polaris] provisioning trueForge (model provider + MCP → ${mcpUrl} + agents) …`);
-    await provisionTrueForge(client, { mcpUrl, mcpSecret });
-    console.log(`[polaris] trueForge ready at ${tfServer?.baseUrl ?? tfUrl} (chat UI + API)`);
   }
 
   const mcpHandler = mcpRouteHandler(mcpSecret);
@@ -74,7 +99,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     development: { hmr: true, console: true },
   });
 
-  const tfUrl = tfServer ? tfServer.baseUrl : `http://localhost:${s.TRUEFORGE_PORT}`;
+  const tfUrl = tfServer ? tfServer.baseUrl : s.TRUEFORGE_BASE_URL || `http://localhost:${s.TRUEFORGE_PORT}`;
   console.log(`\n  Polaris agent-server listening on http://localhost:${server.port}`);
   console.log(`  Web UI:        http://localhost:${server.port}`);
   console.log(`  trueForge UI:  ${tfUrl}`);
