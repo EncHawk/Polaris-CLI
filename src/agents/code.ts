@@ -1,0 +1,362 @@
+import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
+import type { WorkerState, CodeOutput, CodeFile, RunLog } from "../state.ts";
+import { markAgentRun } from "../state.ts";
+import { status, step, output } from "../pipeline/trace.ts";
+import { runAgenticCall } from "../agents_util/loop.ts";
+import { chatCompletion } from "../agents_util/llm.ts";
+import { getSettings } from "../config/settings.ts";
+import { Sandbox } from "../tools/sandbox.ts";
+import { GitHubRepository } from "../tools/github.ts";
+import { saveCodeCheckpoint, loadLatestCheckpoint, deleteCheckpoints } from "../agents_util/checkpoint.ts";
+
+export const CODE_SYSTEM_PROMPT = `You are the CODE agent for an automated paper-reproduction pipeline.
+Implement the paper's claim in PyTorch (or raw Python where the paper specifies).
+
+You have access to a sandboxed Linux environment with Python and common ML libraries.
+
+Rules:
+1. Implement files ONE AT A TIME following the plan order.
+2. Each file does ONE thing (single responsibility principle).
+3. After writing files, run the code to verify it works.
+4. Read error logs carefully and fix before moving on.
+5. Use pure PyTorch unless the paper uses something specific.
+6. You MAY use HuggingFace to load and use REAL model weights. Prefer libraries like \`transformers\`, \`TRL\`, or \`pipelines\` (e.g. \`AutoModel\`, \`AutoModelForCausalLM\`, \`AutoTokenizer\`, \`pipeline\`, \`trl.SFTTrainer\`, \`PEFT\` adapters) whenever the reproduction needs actual pre-trained weights or standard training/eval utilities. Write code that calls these libraries to download and use real weights at runtime.
+7. Do NOT run pip installs or apt installs. You are only writing code — installation happens elsewhere.
+8. When all files are implemented and working, call mark_implementation_complete.
+
+Available tools:
+- write_file: Write a file to the sandbox workspace (provide file_path and content)
+- read_file: Read a file from the sandbox workspace
+- run_command: Run a shell command in the sandbox (provide command, optional timeout)
+- list_files: List files in the sandbox workspace (optional directory filter)
+- mark_implementation_complete: Call this when the implementation is done and working
+
+Start by understanding the plan, then implement files one by one.`;
+
+export const CODE_TOOLS: ToolDef[] = [
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description: "Write a file to the sandbox workspace. Creates parent directories automatically.",
+      parameters: {
+        type: "object",
+        properties: {
+          file_path: { type: "string", description: "Path relative to workspace root" },
+          content: { type: "string", description: "Full file content" },
+        },
+        required: ["file_path", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read a file from the sandbox workspace.",
+      parameters: {
+        type: "object",
+        properties: {
+          file_path: { type: "string", description: "Path relative to workspace root" },
+        },
+        required: ["file_path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_command",
+      description: "Run a shell command in the sandbox. Returns stdout + stderr + return code.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Shell command to execute" },
+          timeout: { type: "integer", description: "Seconds before timeout (default 60)" },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_files",
+      description: "List files in the sandbox workspace directory.",
+      parameters: {
+        type: "object",
+        properties: {
+          directory: { type: "string", description: "Directory to list (default: root)" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "mark_implementation_complete",
+      description: "Call this when the implementation is fully done and working. Provide a summary of what was built.",
+      parameters: {
+        type: "object",
+        properties: {
+          files_written: {
+            type: "array",
+            items: { type: "string" },
+            description: "List of all files written",
+          },
+          summary: { type: "string", description: "What was implemented" },
+          test_results: { type: "string", description: "Results of running the test harness" },
+          caveats: { type: "string", description: "What couldn't be fully implemented and why" },
+        },
+        required: ["files_written", "summary"],
+      },
+    },
+  },
+];
+
+async function generateReadme(arxivId: string, repoName: string, files: CodeFile[]): Promise<string> {
+  const s = getSettings();
+  try {
+    const res = await chatCompletion({
+      model: s.modelFor("CODE"),
+      temperature: 0.3,
+      maxTokens: 2048,
+      messages: [
+        {
+          role: "system",
+          content: "You are a technical writer. Write a concise, good-looking README.md for a GitHub repo that reproduces a research paper.",
+        },
+        {
+          role: "user",
+          content:
+            `Paper: https://arxiv.org/abs/${arxivId}\n` +
+            `Repo: ${repoName}\n` +
+            `Files:\n${files.map((f) => `- ${f.path}`).join("\n")}\n\n` +
+            `Output only the README markdown.`,
+        },
+      ],
+    });
+    const content = res.choices?.[0]?.message?.content;
+    if (content) return content.trim();
+  } catch {
+    /* fall through to static readme */
+  }
+  return `# ${repoName}\n\nPolaris AI reproduction of [arXiv:${arxivId}](https://arxiv.org/abs/${arxivId}).\n\nSee the source files in this repository.\n`;
+}
+
+export async function runCode(state: WorkerState): Promise<Partial<WorkerState>> {
+  const jobUuid = state.job_uuid;
+  const runs = markAgentRun(state, "CODE");
+  status(jobUuid, "coding");
+  const s = getSettings();
+  const userId = state.user_id ?? "";
+  const paperId = state.paper_id ?? "";
+
+  const plan = state.plan ?? {};
+  const read = state.read ?? {};
+  const planBlob = JSON.stringify(plan, null, 2).slice(0, 8000);
+  const readBlob = JSON.stringify(
+    { aim: read.aim, novel_approach: read.novel_approach, numbers: read.numbers },
+    null, 2,
+  ).slice(0, 4000);
+
+  const sandbox = Sandbox.create(jobUuid);
+  const hasGithub = !!s.GITHUB_ACCESS_TOKEN;
+  const repo = hasGithub ? new GitHubRepository() : null;
+  const repoName = state.repo_name || `paper-${state.arxiv_id ?? "unknown"}`;
+  const executionMode = state.execution_mode ?? "create";
+  const existing = !!state.repo_exists || executionMode === "modify" || executionMode === "run";
+  let githubUrl = state.github_url || (repo ? repo.htmlUrl(repoName) : "");
+  const accumulatedLogs: RunLog[] = [];
+  let pushError = "";
+
+  if (existing && repo) {
+    try {
+      const remote = await repo.ensure(repoName);
+      githubUrl = remote.html_url || githubUrl;
+      const prepared = await sandbox.prepareGit(remote.clone_url, remote.token, true);
+      step(jobUuid, "CODE", "repo-checkout", {
+        tool: "github+sandbox",
+        conclusion: `checked out ${repoName} rc=${prepared.returncode}`,
+        output_query: githubUrl,
+      });
+      if (prepared.returncode !== 0) {
+        return {
+          code: { repo_name: repoName, github_url: githubUrl, push_error: prepared.stderr || prepared.stdout || "repo checkout failed" },
+          runs,
+        };
+      }
+    } catch (e) {
+      return {
+        code: { repo_name: repoName, github_url: githubUrl, push_error: `repo checkout failed: ${(e as Error).message}` },
+        runs,
+      };
+    }
+  }
+
+  if (executionMode === "run") {
+    const runResult = await sandbox.exec("python reproduce.py");
+    step(jobUuid, "CODE", "run-existing-repo", {
+      tool: "sandbox",
+      conclusion: `rc=${runResult.returncode} ${runResult.stderr.slice(0, 160) || runResult.stdout.slice(0, 160)}`,
+      output_query: "python reproduce.py",
+    });
+    output(jobUuid, "CODE", `existing repo run rc=${runResult.returncode}`, githubUrl);
+    sandbox.cleanup();
+    return {
+      code: {
+        files: [],
+        run_logs: [{ step: "run-existing", stdout: runResult.stdout.slice(0, 3000), stderr: runResult.stderr.slice(0, 3000) }],
+        notes: "Ran the existing repository without modifying it.",
+        ready: runResult.returncode === 0,
+        output_query: githubUrl,
+        github_url: githubUrl,
+        repo_name: repoName,
+        push_error: runResult.returncode === 0 ? "" : runResult.stderr || "existing repo failed",
+      } as CodeOutput,
+      runs,
+    };
+  }
+
+  const checkpoint = loadLatestCheckpoint(jobUuid);
+  let checkpointContext = "";
+  if (checkpoint) {
+    for (const [path, content] of Object.entries(checkpoint)) {
+      sandbox.writeFile(path, content);
+      step(jobUuid, "CODE", "checkpoint-restore", {
+        tool: "checkpoint",
+        conclusion: `restored ${path} from checkpoint`,
+      });
+    }
+    checkpointContext =
+      "\n\nAlready implemented files from previous checkpoint:\n" + JSON.stringify(checkpoint, null, 2).slice(0, 4000);
+  }
+
+  let data: ToolArgs | null = null;
+  const codeFiles: CodeFile[] = [];
+
+  const handlers: ToolHandlers = {
+    write_file: async (args: ToolArgs) => {
+      const path = String(args["file_path"] ?? "");
+      const content = String(args["content"] ?? "");
+      sandbox.writeFile(path, content);
+      codeFiles.push({ path, contents: content });
+      const allFiles: Record<string, string> = {};
+      for (const f of codeFiles) allFiles[f.path] = f.contents;
+      saveCodeCheckpoint(userId, paperId, jobUuid, allFiles);
+      return `Written ${path}`;
+    },
+    read_file: async (args: ToolArgs) => {
+      const path = String(args["file_path"] ?? "");
+      try {
+        return await sandbox.readFile(path);
+      } catch (e) {
+        return `Error reading ${path}: ${(e as Error).message}`;
+      }
+    },
+    run_command: async (args: ToolArgs) => {
+      const cmd = String(args["command"] ?? "");
+      const timeout = Number(args["timeout"] ?? 120);
+      const r = await sandbox.exec(cmd, timeout);
+      const log: RunLog = {
+        step: `run-${accumulatedLogs.length + 1}`,
+        stdout: r.stdout.slice(0, 3000),
+        stderr: r.stderr.slice(0, 3000),
+      };
+      accumulatedLogs.push(log);
+      return JSON.stringify({ stdout: r.stdout.slice(0, 3000), stderr: r.stderr.slice(0, 3000), returncode: r.returncode });
+    },
+    list_files: async (args: ToolArgs) => {
+      const directory = String(args["directory"] ?? ".");
+      return await sandbox.listFiles(directory);
+    },
+    mark_implementation_complete: async (args: ToolArgs) => {
+      data = args;
+      return "Implementation marked as complete.";
+    },
+  };
+
+  const userMessage =
+    `ARXIV PAPER: https://arxiv.org/abs/${state.arxiv_id ?? ""}\n\n` +
+    `PLAN:\n${planBlob}\n\n` +
+    `READ (context):\n${readBlob}` +
+    `${checkpointContext}`;
+
+  const conversationHistory: ChatMessage[] = [];
+  if (state.orchestrator_feedback) {
+    conversationHistory.push({
+      role: "user",
+      content: `ORCHESTRATOR FEEDBACK on your previous run:\n${state.orchestrator_feedback}\n\nFix the issues and call mark_implementation_complete when done.`,
+    });
+  }
+
+  await runAgenticCall({
+    agentName: "CODE",
+    systemPrompt: CODE_SYSTEM_PROMPT,
+    userMessage,
+    tools: CODE_TOOLS,
+    toolHandlers: handlers,
+    jobUuid,
+    agentEnum: "CODE",
+    maxTokens: s.AGENT_MAX_STEPS * 8192,
+    conversationHistory,
+  });
+
+  if (codeFiles.length === 0) {
+    pushError = "code produced no output";
+  } else {
+    const paths = new Set(codeFiles.map((f) => f.path));
+    if (!paths.has("README.md")) {
+      const readme = await generateReadme(state.arxiv_id ?? "", repoName, codeFiles);
+      sandbox.writeFile("README.md", readme);
+      codeFiles.push({ path: "README.md", contents: readme });
+      step(jobUuid, "CODE", "readme-injected", {
+        tool: "llm:BYOK(OpenAI-compatible)",
+        conclusion: "generated README.md",
+        output_query: "README.md",
+      });
+    }
+    if (repo) {
+      try {
+        const remote = await repo.ensure(repoName, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
+        githubUrl = remote.html_url || githubUrl;
+        if (!existing) {
+          const prepared = await sandbox.prepareGit(remote.clone_url, remote.token, false);
+          if (prepared.returncode !== 0) pushError = prepared.stderr || prepared.stdout || "repo initialization failed";
+        }
+        if (!pushError) {
+          const pushed = await sandbox.publishGit(remote.token, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
+          step(jobUuid, "CODE", "repo-push", {
+            tool: "github+sandbox",
+            conclusion: `pushed ${repoName} rc=${pushed.returncode}`,
+            output_query: githubUrl,
+          });
+          if (pushed.returncode !== 0) pushError = pushed.stderr || pushed.stdout || "repo push failed";
+        }
+      } catch (e) {
+        pushError = `repo publish failed: ${(e as Error).message}`;
+        step(jobUuid, "CODE", "repo-push-failed", {
+          tool: "github+sandbox",
+          conclusion: pushError,
+          output_query: githubUrl,
+        });
+      }
+    }
+  }
+
+  deleteCheckpoints(jobUuid);
+  sandbox.cleanup();
+
+  const d = (data ?? {}) as Record<string, unknown>;
+  const code: CodeOutput = {
+    files: codeFiles,
+    run_logs: accumulatedLogs,
+    notes: String(d["summary"] ?? d["caveats"] ?? ""),
+    ready: data != null,
+    output_query: String(d["summary"] ?? "code produced output"),
+    github_url: githubUrl,
+    repo_name: repoName,
+    push_error: pushError,
+  };
+  return { code, runs };
+}

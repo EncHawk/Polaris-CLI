@@ -1,0 +1,150 @@
+import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
+import type { WorkerState, ResearchOutput, ResearchCitation, RelevantCitation } from "../state.ts";
+import { markAgentRun } from "../state.ts";
+import { status } from "../pipeline/trace.ts";
+import { runAgenticCall } from "../agents_util/loop.ts";
+import { getSettings } from "../config/settings.ts";
+import { searchId, searchTitle } from "../tools/arxiv.ts";
+
+export const RESEARCH_SYSTEM_PROMPT = `You are the RESEARCH agent for an automated paper-reproduction pipeline.
+The READ agent has already extracted a list of relevant citations from the paper.
+
+Your job:
+1. For each citation, use the \`search_arxiv\` tool to fetch its abstract and metadata.
+2. Analyze what each citation claims and how the main paper uses it.
+3. When you have analyzed ALL citations, call \`complete_research\` with your findings.
+
+Be thorough but concise. Cover every citation the READ agent surfaced.
+If a citation lacks an arxiv_id, try searching by title.`;
+
+export const RESEARCH_TOOLS: ToolDef[] = [
+  {
+    type: "function",
+    function: {
+      name: "search_arxiv",
+      description: "Look up an arxiv paper by ID or title to get its abstract and metadata.",
+      parameters: {
+        type: "object",
+        properties: {
+          arxiv_id: { type: "string", description: "Arxiv ID (e.g. 2301.12345)" },
+          title: { type: "string", description: "Paper title to search by (if arxiv_id is unknown)" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "complete_research",
+      description: "Call this when you have analyzed all citations. Submits the final research results.",
+      parameters: {
+        type: "object",
+        properties: {
+          citations: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                arxiv_id: { type: "string" },
+                what_it_claims: { type: "string", description: "What the cited paper does and claims" },
+                how_used: { type: "string", description: "How the main paper uses this citation" },
+              },
+            },
+          },
+          output_query: { type: "string", description: "One sentence summary of the research findings" },
+        },
+        required: ["citations", "output_query"],
+      },
+    },
+  },
+];
+
+export async function runResearch(state: WorkerState): Promise<Partial<WorkerState>> {
+  const jobUuid = state.job_uuid;
+  const runs = markAgentRun(state, "RESEARCH");
+  status(jobUuid, "research");
+
+  const read = state.read ?? {};
+  let cits: RelevantCitation[] = read.relevant_citations ?? [];
+  const s = getSettings();
+  const topN = state.top_n_citations ?? s.ARXIV_MAX_CITATIONS;
+  cits = cits.slice(0, Math.min(topN, s.ARXIV_MAX_CITATIONS));
+
+  const citationsContext = JSON.stringify(cits, null, 2).slice(0, 20000);
+  const novel = JSON.stringify(read.novel_approach ?? {}).slice(0, 2000);
+  const aim = String(read.aim ?? "").slice(0, 2000);
+
+  let data: ToolArgs | null = null;
+  const handlers: ToolHandlers = {
+    search_arxiv: async (args: ToolArgs) => {
+      const aid = String(args["arxiv_id"] ?? "");
+      const title = String(args["title"] ?? "");
+      if (aid) {
+        const meta = await searchId(aid);
+        if (meta) return JSON.stringify(meta);
+      }
+      if (title) {
+        const meta = await searchTitle(title);
+        if (meta) return JSON.stringify(meta);
+      }
+      return JSON.stringify({ arxiv_id: aid, title: "", abstract: "Not found" });
+    },
+    complete_research: async (args: ToolArgs) => {
+      data = args;
+      return "Research results recorded.";
+    },
+  };
+
+  const userMessage =
+    `MAIN PAPER AIM:\n${aim}\n\n` +
+    `MAIN PAPER NOVEL APPROACH:\n${novel}\n\n` +
+    `CITATIONS TO RESEARCH:\n${citationsContext}\n\n` +
+    `Search arxiv for each citation and analyze what it claims and how the main paper uses it.`;
+
+  const conversationHistory: ChatMessage[] = [];
+  if (state.orchestrator_feedback) {
+    conversationHistory.push({
+      role: "user",
+      content: `ORCHESTRATOR FEEDBACK on your previous run:\n${state.orchestrator_feedback}\n\nComplete your research now — analyze all citations and call complete_research.`,
+    });
+  }
+
+  await runAgenticCall({
+    agentName: "RESEARCH",
+    systemPrompt: RESEARCH_SYSTEM_PROMPT,
+    userMessage,
+    tools: RESEARCH_TOOLS,
+    toolHandlers: handlers,
+    jobUuid,
+    agentEnum: "RESEARCH",
+    maxTokens: s.AGENT_MAX_STEPS * 4096,
+    conversationHistory,
+  });
+
+  const notes: ResearchCitation[] = [];
+  if (data) {
+    const d = data as Record<string, unknown>;
+    for (const n of (d["citations"] as Array<Record<string, unknown>>) ?? []) {
+      notes.push({
+        arxiv_id: String(n["arxiv_id"] ?? ""),
+        what_it_claims: String(n["what_it_claims"] ?? ""),
+        how_used: String(n["how_used"] ?? ""),
+      });
+    }
+  }
+
+  if (notes.length === 0 && cits.length) {
+    for (const c of cits) {
+      notes.push({ arxiv_id: c.arxiv_id, what_it_claims: "citation analysis unavailable", how_used: "" });
+    }
+  }
+
+  const research: ResearchOutput = {
+    citations: notes,
+    ready: notes.length > 0,
+    output_query: data
+      ? String((data as Record<string, unknown>)["output_query"] ?? "research complete")
+      : "research produced no output",
+  };
+  return { research, runs };
+}
