@@ -1,0 +1,10 @@
+name = "polaris-mcp"
+main = "worker.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers runtime — no build step needed (wrangler bundles)
+# Root directory: src/mcp (set in Cloudflare dashboard)
+# Build: (empty)
+# Deploy: npx wrangler deploy
+# Secret: npx wrangler secret put POLARIS_MCP_SECRET
