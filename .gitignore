@@ -38,6 +38,10 @@ tests/*
 .npmrc*
 .npmrc
 
+
+*test*
+
+
 EXPLAIN.md
 NOTES.md
 next_task.md

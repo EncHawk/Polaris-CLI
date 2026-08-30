@@ -1,6 +1,6 @@
 {
   "name": "polarisai",
-  "version": "0.1.5",
+  "version": "0.1.7",
   "description": "Polaris AI CLI — a BYOK agent harness that reproduces research papers, powered by trueForge. An MCP to access our agents for harness!",
   "module": "dist/index.js",
   "main": "dist/index.js",
