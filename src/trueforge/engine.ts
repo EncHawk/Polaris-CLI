@@ -41,6 +41,7 @@ const SANDBOX_SKIP_DIRS = [".git", "node_modules", ".venv", "__pycache__", "dist
 /**
  * Extract sandbox file paths from the assistant's `sandbox_artifacts` content
  * block. The block lists files as markdown links: `[name](/absolute/path)`.
+ * Returns the absolute sandbox paths (as the download API expects them).
  * (The part type isn't in the SDK's public TS surface, so parse defensively.)
  */
 export function extractSandboxPaths(content: unknown): string[] {
@@ -51,13 +52,31 @@ export function extractSandboxPaths(content: unknown): string[] {
     if (p?.type !== "sandbox_artifacts" || typeof p.content !== "string") continue;
     for (const m of p.content.matchAll(/\[([^\]]*)\]\(([^)\s]+)\)/g)) {
       const raw = m[2]!.trim();
-      const rel = raw.replace(/^\/+/, "");
-      if (!rel || rel.startsWith("..")) continue;
-      if (rel.split("/").some((seg) => SANDBOX_SKIP_DIRS.includes(seg))) continue;
-      paths.push(rel);
+      if (!raw.startsWith("/") || raw.startsWith("/..")) continue;
+      if (raw.slice(1).split("/").some((seg) => SANDBOX_SKIP_DIRS.includes(seg))) continue;
+      paths.push(raw);
     }
   }
   return [...new Set(paths)];
+}
+
+/**
+ * Map absolute sandbox paths to project-relative paths. trueForge reports
+ * absolute paths (e.g. `/workspace/train.py`); when every artifact sits under
+ * one shared leading directory that directory is the sandbox working root —
+ * not part of the project — so it's stripped, and files land at their
+ * project-relative locations (`train.py`) instead of under an unwanted
+ * `workspace/` directory in the published repo.
+ */
+export function stripSandboxRoot(absPaths: string[]): string[] {
+  const rels = absPaths.map((p) => p.replace(/^\/+/, ""));
+  if (rels.length > 0 && rels.every((p) => p.includes("/"))) {
+    const root = rels[0]!.split("/")[0]!;
+    if (root && rels.every((p) => p.startsWith(root + "/"))) {
+      return rels.map((p) => p.slice(root.length + 1));
+    }
+  }
+  return rels;
 }
 
 export async function runTrueForgeAgentTurn(
@@ -192,25 +211,30 @@ export async function runTrueForgeAgentTurn(
   // Bridge sandbox output back into the pipeline: download every artifact the
   // CODE agent created in the trueForge sandbox so the caller can persist and
   // publish it. Without this, files stay stranded in the sandbox and the run
-  // reports "code produced no output".
+  // reports "code produced no output". Downloads use the absolute sandbox
+  // paths (as the API requires); the workspace gets project-relative paths.
   const sandboxFiles: Array<{ path: string; contents: string }> = [];
   if (sandboxPaths.size > 0 && turnId) {
-    for (const path of [...sandboxPaths].slice(0, MAX_SANDBOX_FILES)) {
+    const originals = [...sandboxPaths].slice(0, MAX_SANDBOX_FILES);
+    const projectPaths = stripSandboxRoot(originals);
+    for (let i = 0; i < originals.length; i++) {
+      const absPath = originals[i]!;
+      const projectPath = projectPaths[i]!;
       try {
-        const resp = await client.sessions.downloadSandboxFile(session.id, turnId, { path });
+        const resp = await client.sessions.downloadSandboxFile(session.id, turnId, { path: absPath });
         const buf = await resp.arrayBuffer();
         if (buf.byteLength > MAX_SANDBOX_FILE_BYTES) {
           step(p.jobUuid, p.agentEnum, "sandbox-bridge-skip", {
             tool: "trueforge:sandbox",
-            conclusion: `skipped ${path} (${buf.byteLength} bytes > ${MAX_SANDBOX_FILE_BYTES})`,
+            conclusion: `skipped ${projectPath} (${buf.byteLength} bytes > ${MAX_SANDBOX_FILE_BYTES})`,
           });
           continue;
         }
-        sandboxFiles.push({ path, contents: new TextDecoder("utf-8", { fatal: false }).decode(buf) });
+        sandboxFiles.push({ path: projectPath, contents: new TextDecoder("utf-8", { fatal: false }).decode(buf) });
       } catch (e) {
         step(p.jobUuid, p.agentEnum, "sandbox-bridge-skip", {
           tool: "trueforge:sandbox",
-          conclusion: `failed to download ${path}: ${(e as Error).message}`,
+          conclusion: `failed to download ${projectPath}: ${(e as Error).message}`,
         });
       }
     }

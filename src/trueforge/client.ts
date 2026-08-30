@@ -4,6 +4,8 @@ import { getSettings } from "../config/settings.ts";
 
 export function makeTrueForgeClient(baseUrlOverride?: string): TrueForge {
   const s = getSettings();
-  const baseUrl = baseUrlOverride ?? s.TRUEFORGE_BASE_URL ?? `http://localhost:${s.TRUEFORGE_PORT}`;
+  // `||` (not `??`): the setting defaults to "" when unset, and an empty
+  // baseUrl would silently override the localhost fallback.
+  const baseUrl = baseUrlOverride || s.TRUEFORGE_BASE_URL || `http://localhost:${s.TRUEFORGE_PORT}`;
   return new TrueForge({ baseUrl, timeoutInSeconds: 600 });
 }

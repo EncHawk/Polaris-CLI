@@ -196,8 +196,8 @@ export async function findExistingImplementation(
         reason: `title search returned candidates but none verified (best: ${best.repo_name}, ${Math.round(confidence * 100)}% token overlap < ${Math.round(TITLE_MATCH_THRESHOLD * 100)}%)`,
       };
     }
-  } catch {
-    /* ignore */
+  } catch (e) {
+    return { found: false, repo: null, candidates: [], reason: `library search failed: ${(e as Error).message}` };
   }
   return { found: false, repo: null, candidates: [], reason: "no existing implementation found" };
 }

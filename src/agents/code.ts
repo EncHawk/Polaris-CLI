@@ -190,7 +190,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     : "create";
   const existing = !!state.repo_exists || executionMode === "modify" || executionMode === "run";
   const engine: EngineType = state.engine ?? "local";
-  const workspace = Workspace.create(repoName, state.output_dir, existing ? "modify" : executionMode);
+  const workspace = await Workspace.create(repoName, state.output_dir, existing ? "modify" : executionMode);
   const hasGithub = !!s.GITHUB_ACCESS_TOKEN;
   const repo = hasGithub ? new GitHubRepository() : null;
   let githubUrl = state.github_url || (repo ? repo.htmlUrl(repoName) : "");
@@ -248,7 +248,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   let checkpointContext = "";
   if (checkpoint) {
     for (const [path, content] of Object.entries(checkpoint)) {
-      workspace.writeFile(path, content);
+      await workspace.writeFile(path, content);
       step(jobUuid, "CODE", "checkpoint-restore", {
         tool: "checkpoint",
         conclusion: `restored ${path} from checkpoint`,
@@ -266,7 +266,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
       const path = String(args["file_path"] ?? "");
       const content = String(args["content"] ?? "");
       try {
-        workspace.writeFile(path, content);
+        await workspace.writeFile(path, content);
       } catch (e) {
         return `Error writing ${path}: ${(e as Error).message}`;
       }
@@ -339,7 +339,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   // locally-written files.
   for (const f of result.sandboxFiles ?? []) {
     try {
-      workspace.writeFile(f.path, f.contents);
+      await workspace.writeFile(f.path, f.contents);
       if (!codeFiles.some((cf) => cf.path === f.path)) codeFiles.push({ path: f.path, contents: f.contents });
       const allFiles: Record<string, string> = {};
       for (const cf of codeFiles) allFiles[cf.path] = cf.contents;
@@ -358,7 +358,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     const paths = new Set(codeFiles.map((f) => f.path));
     if (!paths.has("README.md")) {
       const readme = await generateReadme(state.arxiv_id ?? "", repoName, codeFiles);
-      workspace.writeFile("README.md", readme);
+      await workspace.writeFile("README.md", readme);
       codeFiles.push({ path: "README.md", contents: readme });
       step(jobUuid, "CODE", "readme-injected", {
         tool: "llm:BYOK(OpenAI-compatible)",

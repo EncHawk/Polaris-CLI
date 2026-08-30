@@ -142,10 +142,16 @@ export async function searchPolarisPapers(opts: SearchOpts): Promise<PaperRepo[]
   if (aid) {
     const r = await ghFetch(`${apiBase()}/repos/${org()}/${arxivIdToRepoName(aid)}`);
     if (r.ok) return [toPaperRepo((await r.json()) as GhRepoJson)];
-    // A direct arXiv lookup missed. Callers asking by id expect "the repo for
-    // this paper or nothing" — never fall through to a listing/search that
-    // would return unrelated repositories as if they matched.
-    if (!q) return [];
+    if (r.status === 404) {
+      // A genuine miss: callers asking by id expect "the repo for this paper
+      // or nothing" — never fall through to a listing/search that would
+      // return unrelated repositories as if they matched.
+      if (!q) return [];
+    } else {
+      // Rate limits / auth failures / outages are errors, not "not found" —
+      // surfacing them prevents reuse decisions built on a false miss.
+      throw new Error(`GitHub repo lookup failed: ${r.status} ${r.statusText}`);
+    }
   }
   if (!q) {
     const repos = await listPolarisRepos();

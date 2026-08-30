@@ -49,6 +49,13 @@ export class Settings {
   readonly POLARIS_PORT: number = int("POLARIS_PORT", 8788);
   /** Standalone MCP endpoint port used by `polaris run --engine trueforge`. */
   readonly POLARIS_MCP_PORT: number = int("POLARIS_MCP_PORT", 8791);
+  /**
+   * Externally reachable polaris MCP URL (e.g. https://mcp.example.com/mcp)
+   * for remote trueForge harnesses (POLARIS_TRUEFORGE_BASE_URL). A localhost
+   * MCP URL is useless to a remote harness — localhost resolves on the remote
+   * host. Leave empty for locally managed harnesses.
+   */
+  readonly POLARIS_MCP_PUBLIC_URL: string = str("POLARIS_MCP_PUBLIC_URL", "");
 
   // ─── CODE agent output (writes directly to the client's filesystem) ───────────
   // Where project directories are created. Defaults to the current working

@@ -37,7 +37,7 @@ Ported the full polaris paper-reproduction pipeline (Python/LangGraph → TypeSc
 ### Verified
 
 - `bunx tsc --noEmit` — clean
-- `bun test` — 26/26 pass (incl. regression tests for all Qodo findings)
+- `bun test` — 26/26 pass (incl. regression tests for all Qodo findings, round 1 + 2)
 - `polaris doctor` — config check works
 - `polaris mcp` — MCP initialize + tools/list handshake works over stdio
 - `polaris serve` — web page served (Bun bundler transpiles React), API endpoints work
@@ -65,6 +65,17 @@ All 11 findings from the Qodo code review were fixed:
 11. **reuse flag truthiness** — strict boolean parsing (`"false"` ≠ true); invalid values get 400.
 
 Also fixed while in there: `POLARIS_TRUEFORGE_BASE_URL ?? url` empty-string fallthrough bugs (doctor/setup/agent), and `cmdSetup` no longer points the polaris MCP at trueForge's own URL.
+
+#### Qodo re-review round 2 (8 new findings — all fixed)
+
+1. **Sandbox artifacts gained a root prefix** (High) — artifact links keep their absolute sandbox paths for the download API, and `stripSandboxRoot` maps them to project-relative paths (shared sandbox-root segment stripped), so `/workspace/train.py` lands at `train.py`.
+2. **Workspace writes raced consumers** (High) — `Workspace.writeFile` is now `async` and awaits `Bun.write`; every caller (tool handlers, checkpoint restore, sandbox bridge, README injection, askpass) awaits it.
+3. **Remote harness got a localhost MCP URL** (High) — `POLARIS_MCP_PUBLIC_URL` (new setting) is required to (re)provision a remote trueForge; without it a remote harness is used as provisioned with a clear hint. Local harnesses keep the localhost URL.
+4. **Workspace traversal bypass** (High, security) — `Workspace.abs` resolves with `resolve()` before the containment check, so `a/../../escape` can no longer slip past the string-prefix test.
+5. **Remote trueForge configuration ignored** (High) — `makeTrueForgeClient` uses `||` instead of `??` so the empty-string setting no longer overrides the localhost fallback (also the root cause behind 3).
+6. **GitHub failures became misses** (Medium) — a direct repo lookup only treats 404 as "not found"; rate limits/auth failures/outages throw so reuse decisions never build on a false miss.
+7. **Failed trueForge startup leaked servers** (Medium) — `ensureTrueForgeForRun` wraps harness start + provisioning in one try/catch that stops everything it started before rethrowing.
+8. **Sync writes** (Medium, rule) — workspace marker + test fixtures use `Bun.write` instead of `writeFileSync`.
 
 ### Key design decisions
 

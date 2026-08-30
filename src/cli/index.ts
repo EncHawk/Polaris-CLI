@@ -46,6 +46,7 @@ ENV  (see .env.example)
   POLARIS_API_KEY, POLARIS_BASE_URL, POLARIS_DEFAULT_MODEL  (BYOK LLM)
   POLARIS_PAPERS_ORG, POLARIS_PUBLISH_ORG                   (library + publish targets)
   POLARIS_PORT, POLARIS_MCP_PORT, POLARIS_TRUEFORGE_PORT    (ports)
+  POLARIS_MCP_PUBLIC_URL                                    (remote trueForge harness MCP URL)
   POLARIS_MAX_UPLOAD_MB, POLARIS_MAX_PAPER_CHARS            (upload limits)
   GITHUB_ACCESS_TOKEN, DAYTONA_API_KEY                      (optional)
 `;
@@ -192,11 +193,13 @@ async function cmdRun(rest: string[]): Promise<void> {
 
 /**
  * Boot everything a `--engine trueforge` run needs:
- *   1. a standalone polaris MCP endpoint (completion + search tools) that the
- *      trueForge agents route to,
- *   2. a running trueForge harness (started locally if none is configured),
- *   3. idempotent provisioning (BYOK model provider + polaris MCP + agents).
- * Returns a cleanup function that tears down everything this helper started.
+ *   - locally managed harness (default): start a standalone polaris MCP
+ *     endpoint + the harness itself (if not already running) + provisioning,
+ *   - remote harness (POLARIS_TRUEFORGE_BASE_URL): use it as provisioned, or
+ *     (re)provision with POLARIS_MCP_PUBLIC_URL when set — a localhost MCP
+ *     URL would resolve on the REMOTE host and be unreachable.
+ * Returns a cleanup function that tears down everything this helper started;
+ * on failure everything started so far is stopped before rethrowing.
  */
 async function ensureTrueForgeForRun(): Promise<() => void> {
   const s = getSettings();
@@ -205,45 +208,63 @@ async function ensureTrueForgeForRun(): Promise<() => void> {
     process.exit(1);
   }
 
-  // 1 ── our MCP endpoint on POLARIS_MCP_PORT
-  const mcpPort = s.POLARIS_MCP_PORT;
-  const mcpServer = Bun.serve({
-    port: mcpPort,
-    routes: { "/mcp": mcpRouteHandler(Bun.env["POLARIS_MCP_SECRET"]) },
-    fetch: () => new Response("Not found", { status: 404 }),
-  });
-  const mcpUrl = `http://localhost:${mcpPort}/mcp`;
-
-  // 2 ── the harness itself
-  let tfServer: TrueForgeServer | null = null;
   const baseUrl = s.TRUEFORGE_BASE_URL || `http://localhost:${s.TRUEFORGE_PORT}`;
-  if (!(await isTrueForgeRunning(baseUrl))) {
-    if (s.TRUEFORGE_BASE_URL) {
-      mcpServer.stop(true);
-      console.error(
-        `${RED}trueForge is not reachable at ${s.TRUEFORGE_BASE_URL}. ` +
-          `Start it (npx @truefoundry/trueforge) or unset POLARIS_TRUEFORGE_BASE_URL so polaris can boot one.${RESET}`,
-      );
-      process.exit(1);
-    }
-    console.log(`${DIM}Starting local trueForge harness on ${baseUrl} …${RESET}`);
-    tfServer = await startTrueForgeServer();
+  const remote = !!s.TRUEFORGE_BASE_URL;
+
+  if (remote && !(await isTrueForgeRunning(baseUrl))) {
+    console.error(
+      `${RED}trueForge is not reachable at ${s.TRUEFORGE_BASE_URL}. ` +
+        `Start it (npx @truefoundry/trueforge) or unset POLARIS_TRUEFORGE_BASE_URL so polaris can boot one locally.${RESET}`,
+    );
+    process.exit(1);
   }
 
-  // 3 ── provision (idempotent)
+  const startMcpEndpoint = () =>
+    Bun.serve({
+      port: s.POLARIS_MCP_PORT,
+      routes: { "/mcp": mcpRouteHandler(Bun.env["POLARIS_MCP_SECRET"]) },
+      fetch: () => new Response("Not found", { status: 404 }),
+    });
+
+  let tfServer: TrueForgeServer | null = null;
+  let mcpServer: ReturnType<typeof Bun.serve> | null = null;
+
   try {
-    const client = makeTrueForgeClient(baseUrl);
-    console.log(`${DIM}Provisioning trueForge (BYOK model + polaris MCP → ${mcpUrl}) …${RESET}`);
-    await provisionTrueForge(client, { mcpUrl, mcpSecret: Bun.env["POLARIS_MCP_SECRET"] });
+    if (remote) {
+      if (s.POLARIS_MCP_PUBLIC_URL) {
+        console.log(`${DIM}Starting local MCP endpoint (advertised as ${s.POLARIS_MCP_PUBLIC_URL}) …${RESET}`);
+        mcpServer = startMcpEndpoint();
+        console.log(`${DIM}Provisioning remote trueForge at ${baseUrl} …${RESET}`);
+        await provisionTrueForge(makeTrueForgeClient(baseUrl), {
+          mcpUrl: s.POLARIS_MCP_PUBLIC_URL,
+          mcpSecret: Bun.env["POLARIS_MCP_SECRET"],
+        });
+      } else {
+        console.log(
+          `${DIM}Using remote trueForge at ${baseUrl} as provisioned. ` +
+            `If its agents are missing polaris tools, set POLARIS_MCP_PUBLIC_URL to an externally reachable polaris MCP URL ` +
+            `and polaris will (re)provision it, or run: polaris setup --base-url ${baseUrl}${RESET}`,
+        );
+      }
+    } else {
+      const mcpUrl = `http://localhost:${s.POLARIS_MCP_PORT}/mcp`;
+      mcpServer = startMcpEndpoint();
+      if (!(await isTrueForgeRunning(baseUrl))) {
+        console.log(`${DIM}Starting local trueForge harness on ${baseUrl} …${RESET}`);
+        tfServer = await startTrueForgeServer();
+      }
+      console.log(`${DIM}Provisioning trueForge (BYOK model + polaris MCP → ${mcpUrl}) …${RESET}`);
+      await provisionTrueForge(makeTrueForgeClient(baseUrl), { mcpUrl, mcpSecret: Bun.env["POLARIS_MCP_SECRET"] });
+    }
   } catch (e) {
     tfServer?.stop();
-    mcpServer.stop(true);
+    mcpServer?.stop(true);
     throw e;
   }
 
   return () => {
     tfServer?.stop();
-    mcpServer.stop(true);
+    mcpServer?.stop(true);
   };
 }
 

@@ -10,8 +10,8 @@
  * This replaces the polaris-backend's Daytona sandbox + Supabase mirror — the
  * CLI runs fully standalone on the user's machine.
  */
-import { mkdirSync, existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
+import { mkdirSync, existsSync, readdirSync, statSync } from "node:fs";
+import { dirname, join, resolve, relative, sep } from "node:path";
 import { getSettings } from "../config/settings.ts";
 import { exec as localExec } from "./local-exec.ts";
 
@@ -65,7 +65,7 @@ export class Workspace {
    * `.polaris-workspace` marker) is refused, so a run can never commit and
    * push an unrelated host directory.
    */
-  static create(repoName: string, outputDir?: string, mode: "create" | "modify" | "run" = "create"): Workspace {
+  static async create(repoName: string, outputDir?: string, mode: "create" | "modify" | "run" = "create"): Promise<Workspace> {
     const s = getSettings();
     const base = resolve(outputDir || s.POLARIS_OUTPUT_DIR || ".");
     const safe = sanitizeRepoName(repoName);
@@ -85,7 +85,7 @@ export class Workspace {
     mkdirSync(dir, { recursive: true });
     if (mode !== "run") {
       const marker = join(dir, MARKER_FILE);
-      if (!existsSync(marker)) writeFileSync(marker, `polaris workspace: ${safe}\n`);
+      if (!existsSync(marker)) await Bun.write(marker, `polaris workspace: ${safe}\n`);
     }
     return new Workspace(dir, safe);
   }
@@ -94,19 +94,24 @@ export class Workspace {
     return existsSync(join(dir, MARKER_FILE));
   }
 
-  /** Resolve `path` inside the workspace; throws if it would escape the workspace. */
+  /**
+   * Resolve `path` inside the workspace; throws if it would escape the
+   * workspace. Uses `resolve` (not `join`) so `..` components are normalized
+   * BEFORE the containment check — an unnormalized `workdir/../outside` would
+   * pass a naive string-prefix test while actually pointing outside.
+   */
   private abs(path: string): string {
-    const p = isAbsolute(path) ? path : join(this.workdir, path);
+    const p = resolve(this.workdir, path);
     if (p !== this.workdir && !p.startsWith(this.workdir + sep)) {
       throw new Error(`Path escapes the workspace: ${path}`);
     }
     return p;
   }
 
-  writeFile(path: string, contents: string): string {
+  async writeFile(path: string, contents: string): Promise<string> {
     const p = this.abs(path);
     mkdirSync(dirname(p), { recursive: true });
-    Bun.write(p, contents);
+    await Bun.write(p, contents);
     return p;
   }
 
@@ -155,7 +160,7 @@ export class Workspace {
       `  *Username*) printf '%s\\n' polaris-bot ;;\n` +
       `  *) printf '%s\\n' ${shQuote(token)} ;;\n` +
       `esac\n`;
-    this.writeFile(".polaris_git_askpass", script);
+    await this.writeFile(".polaris_git_askpass", script);
     await this.exec(`chmod 700 ${shQuote(askpass)}`, 10);
     const env =
       `export GIT_ASKPASS=${shQuote(askpass)} ` +

@@ -73,12 +73,12 @@ test("workspace writes and reads files on the real filesystem", async () => {
   const { Workspace } = await import("../src/tools/workspace.ts");
   const { rmSync } = await import("node:fs");
   const tmp = `/tmp/polaris-test-${crypto.randomUUID()}`;
-  const ws = Workspace.create("test-repo", tmp);
+  const ws = await Workspace.create("test-repo", tmp);
   expect(ws.workdir.includes("test-repo")).toBe(true);
-  ws.writeFile("hello.py", "print('world')");
+  await ws.writeFile("hello.py", "print('world')");
   const content = await ws.readFile("hello.py");
   expect(content).toBe("print('world')");
-  ws.writeFile("src/deep/nested.py", "# nested");
+  await ws.writeFile("src/deep/nested.py", "# nested");
   const nested = await ws.readFile("src/deep/nested.py");
   expect(nested).toBe("# nested");
   const r = await ws.exec("echo testing");
@@ -234,27 +234,29 @@ test("sanitizeRepoName reduces repo names to a safe single component", async () 
 
 test("Workspace refuses unowned non-empty dirs and confines file paths", async () => {
   const { Workspace } = await import("../src/tools/workspace.ts");
-  const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { mkdirSync, rmSync } = await import("node:fs");
   const { join } = await import("node:path");
   const tmp = `/tmp/polaris-ws-${crypto.randomUUID()}`;
 
   // create mode refuses a pre-existing non-empty directory polaris doesn't own
   const foreign = join(tmp, "foreign");
   mkdirSync(foreign, { recursive: true });
-  writeFileSync(join(foreign, "secret.txt"), "do not commit me");
-  expect(() => Workspace.create("foreign", tmp)).toThrow(/already exists and is not empty/);
+  await Bun.write(join(foreign, "secret.txt"), "do not commit me");
+  await expect(Workspace.create("foreign", tmp)).rejects.toThrow(/already exists and is not empty/);
 
   // a workspace polaris created itself can be reopened (retry flow)
-  const mine = Workspace.create("mine", tmp);
-  mine.writeFile("code.py", "print(1)");
-  expect(() => Workspace.create("mine", tmp)).not.toThrow();
+  const mine = await Workspace.create("mine", tmp);
+  await mine.writeFile("code.py", "print(1)");
+  await expect(Workspace.create("mine", tmp)).resolves.toBeTruthy();
 
   // modify mode explicitly adopts an existing directory
-  expect(() => Workspace.create("foreign", tmp, "modify")).not.toThrow();
+  await expect(Workspace.create("foreign", tmp, "modify")).resolves.toBeTruthy();
 
-  // file operations cannot escape the workspace
-  expect(() => mine.writeFile("../escape.txt", "x")).toThrow(/escapes the workspace/);
-  expect(() => mine.writeFile("/tmp/escape.txt", "x")).toThrow(/escapes the workspace/);
+  // file operations cannot escape the workspace — including via `..` that a
+  // naive join+prefix check would let through
+  await expect(mine.writeFile("../escape.txt", "x")).rejects.toThrow(/escapes the workspace/);
+  await expect(mine.writeFile("/tmp/escape.txt", "x")).rejects.toThrow(/escapes the workspace/);
+  await expect(mine.writeFile("a/../../escape.txt", "x")).rejects.toThrow(/escapes the workspace/);
   await expect(mine.readFile("../escape.txt")).rejects.toThrow(/escapes the workspace/);
 
   // marker + askpass files stay out of listings
@@ -325,7 +327,7 @@ test("parseStrictBool never truthy-coerces the string \"false\"", async () => {
 });
 
 test("extractSandboxPaths parses trueForge sandbox artifact blocks", async () => {
-  const { extractSandboxPaths } = await import("../src/trueforge/engine.ts");
+  const { extractSandboxPaths, stripSandboxRoot } = await import("../src/trueforge/engine.ts");
   const content = [
     { type: "text", content: "Implementation complete." },
     {
@@ -333,7 +335,16 @@ test("extractSandboxPaths parses trueForge sandbox artifact blocks", async () =>
       content: "[train.py](/workspace/train.py)\n[model.py](/workspace/src/model.py)\n[junk](/workspace/.git/config)",
     },
   ];
-  expect(extractSandboxPaths(content)).toEqual(["workspace/train.py", "workspace/src/model.py"]);
+  // absolute sandbox paths, junk filtered (as the download API expects them)
+  expect(extractSandboxPaths(content)).toEqual(["/workspace/train.py", "/workspace/src/model.py"]);
   expect(extractSandboxPaths("plain string")).toEqual([]);
   expect(extractSandboxPaths([{ type: "text", content: "no artifacts" }])).toEqual([]);
+  // the shared sandbox-root segment is stripped so files land project-relative
+  expect(stripSandboxRoot(["/workspace/train.py", "/workspace/src/model.py"])).toEqual([
+    "train.py",
+    "src/model.py",
+  ]);
+  // no shared root → paths kept as-is (relative, no leading slash)
+  expect(stripSandboxRoot(["/workspace/a.py", "/other/b.py"])).toEqual(["workspace/a.py", "other/b.py"]);
+  expect(stripSandboxRoot(["/train.py"])).toEqual(["train.py"]);
 });
