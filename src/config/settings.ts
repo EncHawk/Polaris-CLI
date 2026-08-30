@@ -1,10 +1,54 @@
 /**
  * BYOK configuration — port of polaris/worker-agent/worker/config.py.
  *
- * Bun loads .env automatically, so we read the environment directly. Every
- * model/credential is bring-your-own; nothing is hardcoded to a provider.
+ * Bun loads `.env` from the current working directory automatically. When the
+ * CLI is installed globally (npm i -g polaris-cli) users run it from arbitrary
+ * directories, so we also load `~/.polaris/.env` as a global credential file —
+ * values already present (cwd `.env`, real environment) always win.
  */
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
 const env: Record<string, string | undefined> = Bun.env as Record<string, string | undefined>;
+
+/** Parse a .env-style file into KEY=VALUE pairs (comments + quotes handled). */
+export function parseEnvFile(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim().replace(/^export\s+/, "");
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    const m = val.match(/^(['"])(.*)\1$/s);
+    if (m) val = m[2]!;
+    if (key in Bun.env) continue; // real env / cwd .env wins
+    out[key] = val;
+  }
+  return out;
+}
+
+let _globalLoaded = false;
+function loadGlobalEnvFile(): void {
+  if (_globalLoaded) return;
+  _globalLoaded = true;
+  try {
+    const path = join(homedir(), ".polaris", ".env");
+    if (!existsSync(path)) return;
+    for (const [k, v] of Object.entries(parseEnvFile(readFileSync(path, "utf-8")))) {
+      if (env[k] == null) env[k] = v;
+    }
+  } catch {
+    /* a config file must never break the CLI */
+  }
+}
+
+/** Location of the global config file (for doctor output). */
+export function globalEnvPath(): string {
+  return join(homedir(), ".polaris", ".env");
+}
 
 function str(key: string, fallback = ""): string {
   const v = env[key];
@@ -101,6 +145,9 @@ export class Settings {
 
 let _settings: Settings | null = null;
 export function getSettings(): Settings {
-  if (_settings == null) _settings = new Settings();
+  if (_settings == null) {
+    loadGlobalEnvFile();
+    _settings = new Settings();
+  }
   return _settings;
 }

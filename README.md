@@ -9,16 +9,48 @@ bun install
 cp .env.example .env       # fill in POLARIS_API_KEY (any OpenAI-compatible endpoint)
 
 bun ./index.ts doctor      # verify config
-bun ./index.ts run 2403.09876          # run the pipeline (interactive TUI)
+bun ./index.ts run 2403.09876          # run the pipeline (full-screen chat TUI)
 bun ./index.ts run --file paper.pdf --engine local   # reproduce from an uploaded PDF
 bun ./index.ts serve --tf              # start agent-server + trueForge (web UI + API + MCP + uploads)
 ```
+
+## Global installation (npm)
+
+```bash
+npm i -g polaris-cli       # requires bun on your PATH (the CLI runs on Bun)
+polaris doctor
+polaris run 2403.09876
+```
+
+When installed globally, put your credentials in `~/.polaris/.env` (same keys as `.env.example`) so they apply from any directory. A `./.env` in your working directory and your real environment always take precedence.
+
+### Credentials you need
+
+| Credential | Required | What it's for |
+|------------|----------|---------------|
+| `POLARIS_API_KEY` | **yes** | BYOK LLM access — any OpenAI-compatible endpoint (`POLARIS_BASE_URL`, default DeepInfra). You pay your provider directly. |
+| `GITHUB_ACCESS_TOKEN` | no | Pushing generated reproductions to `POLARIS_PUBLISH_ORG` + a higher rate limit for library retrieval. Without it nothing is published and library search is anonymous (60 req/h). |
+| `POLARIS_MCP_SECRET` | no | Auth header for the MCP endpoint when you expose it beyond loopback. |
+| `POLARIS_MCP_PUBLIC_URL` | no | Only for remote trueForge harnesses (`POLARIS_TRUEFORGE_BASE_URL`) — an externally reachable polaris MCP URL. |
+| npm publish token | only to publish the package | The package itself is shipped to the registry by a maintainer. |
+
+No other credentials: trueForge runs locally with SQLite, checkpoints live in `~/.polaris/`, outputs are created in your current directory.
+
+## The chat TUI
+
+`polaris run` opens a full-screen chat interface: live agent transcript (scroll with ↑/↓), the plan rendered as a card when it needs approval, and an always-available input line.
+
+- While a plan awaits approval: `⏎` (or `y`) approves, `n` rejects, or type anything else and hit `⏎` to send it as feedback (the pipeline replans).
+- After a run: `:rerun [feedback]` runs again (with optional plan feedback), `:modify <feedback>` re-runs against the produced repo with your CODE feedback, `:url` prints the repo URL, `:q` quits.
+- `Ctrl-C` cancels at any time; output is left on your filesystem.
+
+Non-TTY environments (piped output, CI) automatically fall back to plain line streaming.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `polaris run <arxiv-id> [--auto] [--file <path>] [--engine local\|trueforge] [--reuse]` | Run the pipeline with live TUI streaming. `--file` reads a PDF/markdown/tex file; `--engine` picks the BYOK ReAct loop or trueForge harness; `--reuse` returns an existing library implementation if one exists. `--auto` skips plan approval. |
+| `polaris run <arxiv-id> [--auto] [--file <path>] [--engine local\|trueforge] [--reuse]` | Run the pipeline in the full-screen chat TUI (plan approval + typed feedback + post-run commands). `--file` reads a PDF/markdown/tex file; `--engine` picks the BYOK ReAct loop or trueForge harness; `--reuse` returns an existing library implementation if one exists. `--auto` skips plan approval. |
 | `polaris serve [--tf] [--port N]` | Start the agent-server (web UI + REST API + SSE + MCP route + file uploads). `--tf` boots and provisions a local trueForge harness. |
 | `polaris mcp` | Run the polaris MCP server over stdio (for claude-code, codex, etc.). |
 | `polaris setup [--base-url URL]` | Provision an existing trueForge server with the BYOK model + MCP + agents. |
@@ -33,9 +65,11 @@ bun ./index.ts serve --tf              # start agent-server + trueForge (web UI 
 │                                                               │
 │  src/cli/index.ts        command router (run/serve/mcp/…)     │
 │                                                               │
-│  ┌─────────────── pipeline (ported from polaris) ──────────┐ │
-│  │ READ → (gate) → RESEARCH → (gate) → PLAN → APPROVE      │ │
-│  │   → CODE → (gate) → END                                  │ │
+ │  ┌─────────────── pipeline (ported from polaris) ──────────┐ │
+ │  │ READ → (gate) → RESEARCH → (gate) → PLAN → APPROVE      │ │
+ │  │   → CODE → (gate) → VERIFY → END                          │ │
+ │  │     VERIFY ensures every plan delta and initial/          │ │
+ │  │     additional-query signal was persisted in the repo     │ │
 │  │                                                           │ │
 │  │  agents/        system prompts + OpenAI tool defs        │ │
 │  │  agents_util/   ReAct agentic loop + checkpoints         │ │

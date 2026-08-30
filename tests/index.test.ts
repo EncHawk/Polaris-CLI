@@ -96,6 +96,23 @@ test("completion tool mapping covers all agents", () => {
   expect(COMPLETION_TOOL.RESEARCH).toBe("complete_research");
   expect(COMPLETION_TOOL.PLAN).toBe("complete_plan");
   expect(COMPLETION_TOOL.CODE).toBe("mark_implementation_complete");
+  expect(COMPLETION_TOOL.VERIFY).toBe("complete_verify");
+});
+
+test("verify agent exposes expected tools and prompt", async () => {
+  const { VERIFY_TOOLS, VERIFY_SYSTEM_PROMPT } = await import("../src/agents/verify.ts");
+  expect(VERIFY_SYSTEM_PROMPT).toContain("VERIFY");
+  const names = VERIFY_TOOLS.map((t) => t.function.name);
+  expect(names).toContain("complete_verify");
+  expect(names).toContain("read_file");
+  expect(names).toContain("list_files");
+});
+
+test("polaris agent specs include verify", async () => {
+  const { polarisAgentSpecs, POLARIS_AGENT_NAMES } = await import("../src/trueforge/agents.ts");
+  expect(POLARIS_AGENT_NAMES).toContain("polaris-verify");
+  const specs = polarisAgentSpecs();
+  expect(specs.verify).toBeTruthy();
 });
 
 // ─── Phase 2: Polaris coded-implementation retrieval ────────────────────────────
@@ -348,3 +365,44 @@ test("extractSandboxPaths parses trueForge sandbox artifact blocks", async () =>
   expect(stripSandboxRoot(["/workspace/a.py", "/other/b.py"])).toEqual(["workspace/a.py", "other/b.py"]);
   expect(stripSandboxRoot(["/train.py"])).toEqual(["train.py"]);
 });
+
+test("wrapText and visibleLen handle ANSI and word boundaries", async () => {
+  const { wrapText, visibleLen } = await import("../src/server/tui.ts");
+  expect(visibleLen("\x1b[34mhello\x1b[0m")).toBe(5);
+  expect(visibleLen("plain")).toBe(5);
+  expect(wrapText("hello world", 20)).toEqual(["hello world"]);
+  expect(wrapText("hello world foo bar", 10)).toEqual(["hello", "world foo", "bar"]);
+  // a single long word is hard-split
+  expect(wrapText("abcdefghij", 4)).toEqual(["abcd", "efgh", "ij"]);
+  // ANSI-styled strings wrap on visible width, not raw length
+  expect(wrapText("\x1b[34mhello\x1b[0m world", 8)).toEqual(["\x1b[34mhello\x1b[0m", "world"]);
+});
+
+test("parseEnvFile ignores comments, handles quotes, and defers env-var wins", async () => {
+  const { parseEnvFile } = await import("../src/config/settings.ts");
+  const text = [
+    "# comment",
+    "FOO=bar",
+    "QUOTED=\"hello world\"",
+    "SINGLE='it works'",
+    "EXPORTED=1",
+    "export EXPORTED2=2",
+    "EMPTY=",
+    "  SPACED = spaced val ",
+  ].join("\n");
+  const out = parseEnvFile(text);
+  expect(out.FOO).toBe("bar");
+  expect(out.QUOTED).toBe("hello world");
+  expect(out.SINGLE).toBe("it works");
+  expect(out.EXPORTED).toBe("1");
+  expect(out.EXPORTED2).toBe("2");
+  expect(out.EMPTY).toBe("");
+  expect(out.SPACED).toBe("spaced val");
+  // keys already in Bun.env are skipped — force a real env var and ensure it wins
+  Bun.env["__POLARIS_TEST_PARSE_ENV"] = "real";
+  const out2 = parseEnvFile("__POLARIS_TEST_PARSE_ENV=from_file");
+  expect(out2["__POLARIS_TEST_PARSE_ENV"]).toBeUndefined();
+  delete Bun.env["__POLARIS_TEST_PARSE_ENV"];
+});
+
+/* end of file */

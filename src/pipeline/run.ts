@@ -40,6 +40,10 @@ export interface Job {
   reuse_if_exists?: boolean;
   /** Directory to create the project in (defaults to POLARIS_OUTPUT_DIR or cwd). */
   output_dir?: string;
+  /** Pre-seeded PLAN feedback (chat follow-up runs: `:rerun <feedback>`). */
+  plan_feedback?: string;
+  /** Pre-seeded CODE feedback (chat follow-up runs: `:modify <feedback>`). */
+  code_feedback?: string;
 }
 
 /** Fetch a starter markdown (title + authors + abstract) from the arxiv abs page. */
@@ -157,6 +161,8 @@ export async function runOne(job: Job): Promise<WorkerState> {
     engine,
     output_dir: job.output_dir,
     library_hit: libraryHit,
+    plan_feedback: job.plan_feedback,
+    orchestrator_feedback: job.code_feedback,
     iteration: {},
     runs: {},
     history: [],
@@ -179,9 +185,22 @@ export async function runOne(job: Job): Promise<WorkerState> {
   } else if (final.code?.push_error) {
     error(jobUuid, "CODE", final.code.push_error);
     status(jobUuid, "failed");
+  } else if (final.verify && final.verify.checks_passed === false) {
+    const msg = final.verify.missing_signals?.join("; ") || final.verify.output_query || "verify failed";
+    error(jobUuid, "VERIFY", msg);
+    status(jobUuid, "failed", { verify_failed: true });
   } else {
     const ghUrl = final.code?.github_url ?? "";
-    status(jobUuid, "done", { github_url: ghUrl });
+    const vInfo = final.verify ? ` · verify: ${final.verify.checks_passed ? "passed" : "skipped"}` : "";
+    status(jobUuid, "done", { github_url: ghUrl, verify: final.verify?.checks_passed });
+    if (final.verify?.checks_passed) {
+      step(jobUuid, "VERIFY", "verify-passed", {
+        tool: "verify",
+        conclusion: final.verify.output_query ?? "all signals persisted",
+      });
+    } else if (vInfo) {
+      step(jobUuid, "VERIFY", "verify-skipped", { tool: "verify", conclusion: vInfo });
+    }
   }
   step(jobUuid, "SYSTEM", "job-end", {
     tool: "graph",

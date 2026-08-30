@@ -34,7 +34,7 @@ export interface McpServerOptions {
 export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
   const server = new McpServer(SERVER_INFO, {
     instructions:
-      "Polaris AI paper-reproduction pipeline. Agents call complete_* / mark_implementation_complete to submit structured output, search_arxiv to look up citation metadata, and search_polaris_papers / get_polaris_implementation to retrieve an existing coded reproduction from the PolarisAI-Implementations library. External agents call polaris_run to reproduce an arXiv paper end-to-end.",
+      "Polaris AI paper-reproduction pipeline (READ → RESEARCH → PLAN → CODE → VERIFY). Agents call complete_* / mark_implementation_complete / complete_verify to submit structured output, search_arxiv to look up citation metadata, and search_polaris_papers / get_polaris_implementation to retrieve an existing coded reproduction from the PolarisAI-Implementations library. External agents call polaris_run to reproduce an arXiv paper end-to-end.",
   });
 
   // ─── Completion signal tools (args carry the structured output) ──────────────
@@ -118,6 +118,23 @@ export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
       },
     },
     async () => ({ content: [{ type: "text", text: "Implementation marked as complete." }] }),
+  );
+
+  server.registerTool(
+    "complete_verify",
+    {
+      description: "Call with your verification result once all checks are done — confirms the implementation persisted every signal from the initial paper intake and the plan.",
+      inputSchema: {
+        plan_signals_covered: z.array(z.string()).describe("Plan signals/deltas present in the implementation"),
+        missing_signals: z.array(z.string()).describe("Plan/initial signals missing or not persisted"),
+        initial_queries_covered: z.array(z.string()).describe("Initial READ / additional-query signals covered"),
+        files_verified: z.array(z.string()).describe("Files that exist and passed checks"),
+        files_missing: z.array(z.string()).describe("Planned files that are absent"),
+        checks_passed: z.boolean().describe("Overall pass/fail"),
+        output_query: z.string().describe("One-sentence summary"),
+      },
+    },
+    async () => ({ content: [{ type: "text", text: "Verification recorded." }] }),
   );
 
   // ─── arxiv lookup (used by the RESEARCH agent) ───────────────────────────────
@@ -256,7 +273,7 @@ export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
     "polaris_run",
     {
       description:
-        "Run the full Polaris paper-reproduction pipeline (READ -> RESEARCH -> PLAN -> CODE) for an arXiv paper or an uploaded paper's text. " +
+        "Run the full Polaris paper-reproduction pipeline (READ -> RESEARCH -> PLAN -> CODE -> VERIFY) for an arXiv paper or an uploaded paper's text. " +
         "First checks the Polaris coded-implementation library for an existing reproduction; if found and reuse_if_exists=true, returns the existing repo. " +
         "Otherwise generates the code with the BYOK LLM (or trueForge harness) and pushes it to GitHub. " +
         "Auto-approves the plan (non-interactive). Requires POLARIS_API_KEY (BYOK) on the polaris CLI host.",

@@ -80,7 +80,18 @@ export interface CodeOutput {
   push_error?: string;
 }
 
-export type AgentName = "SYSTEM" | "READ" | "RESEARCH" | "PLAN" | "CODE" | "ORCHESTRATOR";
+export interface VerifyOutput {
+  plan_signals_covered?: string[];
+  missing_signals?: string[];
+  initial_queries_covered?: string[];
+  files_verified?: string[];
+  files_missing?: string[];
+  checks_passed?: boolean;
+  ready?: boolean;
+  output_query?: string;
+}
+
+export type AgentName = "SYSTEM" | "READ" | "RESEARCH" | "PLAN" | "CODE" | "VERIFY" | "ORCHESTRATOR";
 
 export interface WorkerState {
   job_uuid: string;
@@ -98,6 +109,7 @@ export interface WorkerState {
   research?: ResearchOutput;
   plan?: PlanOutput;
   code?: CodeOutput;
+  verify?: VerifyOutput;
 
   approved?: boolean;
   iteration?: Record<string, number>;

@@ -29,7 +29,9 @@ USAGE
 COMMANDS
   run <arxiv-id> [--auto] [--file <path>] [--engine local|trueforge]
                      [--reuse] [--output <dir>] [--repo <name>] [--mode create|modify|run]
-                                   Run the pipeline (interactive TUI)
+                                   Run the pipeline in the full-screen chat TUI
+                                   (approve plans inline, type feedback, then
+                                    :rerun / :modify / :q when the run ends)
                                      --file     read a PDF/markdown/tex file instead of fetching by arxiv id
                                      --engine   local (BYOK ReAct loop, default) | trueforge (boots + provisions the harness)
                                      --reuse    if an existing coded implementation is found in the library, reuse it
@@ -360,7 +362,15 @@ async function cmdAgent(rest: string[]): Promise<void> {
 async function cmdDoctor(rest: string[]): Promise<void> {
   void rest;
   const s = getSettings();
+  const { globalEnvPath } = await import("../config/settings.ts");
+  const { existsSync } = await import("node:fs");
   console.log(`${BOLD}Polaris doctor${RESET}\n`);
+
+  // Config files (cwd .env loaded by Bun; ~/.polaris/.env for global installs)
+  const cwdEnv = existsSync(".env");
+  const globalEnv = existsSync(globalEnvPath());
+  console.log(`  ${cwdEnv ? GREEN + "✓" : YELLOW + "○"}${RESET} ./.env ${DIM}${cwdEnv ? "loaded" : "not found"}${RESET}`);
+  console.log(`  ${globalEnv ? GREEN + "✓" : YELLOW + "○"}${RESET} ~/.polaris/.env ${DIM}${globalEnv ? "loaded (global credentials)" : "not found (optional — home for credentials when installed globally)"}${RESET}`);
 
   // BYOK LLM
   const llmOk = !!s.POLARIS_API_KEY;

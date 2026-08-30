@@ -2,9 +2,11 @@
  * Pipeline graph driver — port of worker/graph.py.
  *
  * LangGraph wiring: READ -> (gate) -> RESEARCH -> (gate) -> PLAN -> APPROVE ->
- * CODE -> (gate) -> END. We re-implement the conditional edges as an explicit
- * driver (no langgraph dependency). A too-strict orchestrator is force-advanced
- * after MAX_GATE_RETRIES or when an agent's output stops changing.
+ * CODE -> (gate) -> VERIFY -> END. We re-implement the conditional edges as
+ * an explicit driver (no langgraph dependency). A too-strict orchestrator is
+ * force-advanced after MAX_GATE_RETRIES or when an agent's output stops
+ * changing. VERIFY checks that CODE persisted every signal from READ/PLAN and
+ * the additional queries.
  */
 import type { WorkerState, AgentName } from "../state.ts";
 import { error, status, step } from "./trace.ts";
@@ -13,6 +15,7 @@ import { runRead } from "../agents/read.ts";
 import { runResearch } from "../agents/research.ts";
 import { runPlan } from "../agents/plan.ts";
 import { runCode } from "../agents/code.ts";
+import { runVerify } from "../agents/verify.ts";
 
 const MAX_GATE_RETRIES = 2;
 const END = "__end__";
@@ -46,7 +49,7 @@ function failed(state: WorkerState): void {
   state.status = "failed";
 }
 
-type Node = "read" | "research" | "plan" | "code" | "failed" | typeof END;
+type Node = "read" | "research" | "plan" | "code" | "verify" | "failed" | typeof END;
 
 async function runNode(state: WorkerState, node: Exclude<Node, typeof END | "failed">): Promise<void> {
   step(state.job_uuid, "SYSTEM", `enter-${node}`, { tool: "graph", conclusion: node });
@@ -63,6 +66,9 @@ async function runNode(state: WorkerState, node: Exclude<Node, typeof END | "fai
       break;
     case "code":
       update = await runCode(state);
+      break;
+    case "verify":
+      update = await runVerify(state);
       break;
   }
   Object.assign(state, update);
@@ -116,15 +122,32 @@ async function gatePlan(state: WorkerState): Promise<Node> {
 
 async function gateCode(state: WorkerState): Promise<Node> {
   const codeOut = state.code;
+  // CODE failures are terminal here — VERIFY is only for successful CODE
+  // outputs. A failed CODE (push_error/empty) goes straight to `failed`.
+  if (!codeOut || codeOut.push_error) return "failed";
   if (runsOf(state, "CODE") >= MAX_GATE_RETRIES || isStuckRepeat(state, "CODE", codeOut)) {
     delete state.orchestrator_feedback;
     if (!state.code) return "failed";
     recordOutputHash(state, "CODE", codeOut);
-    return END;
+    return "verify";
   }
   const passed = await orchesgate(state, "CODE");
   recordOutputHash(state, "CODE", codeOut);
-  return passed ? END : "code";
+  return passed ? "verify" : "code";
+}
+
+async function gateVerify(state: WorkerState): Promise<Node> {
+  const v = state.verify;
+  if (!v || !v.ready) return "failed";
+  // A strict verify failure is terminal — the run's code didn't persist the
+  // required signals. The user can fix via `:modify`/`:rerun` in the chat TUI.
+  if (v.checks_passed === false) {
+    state.error = v.missing_signals?.join("; ") || v.output_query || "verify failed";
+    error(state.job_uuid, "VERIFY", state.error);
+    status(state.job_uuid, "failed");
+    return "failed";
+  }
+  return END;
 }
 
 const GATES: Record<Exclude<Node, typeof END | "failed">, (s: WorkerState) => Promise<Node>> = {
@@ -132,6 +155,7 @@ const GATES: Record<Exclude<Node, typeof END | "failed">, (s: WorkerState) => Pr
   research: gateResearch,
   plan: gatePlan,
   code: gateCode,
+  verify: gateVerify,
 };
 
 /** Drive the pipeline to completion and return the final state. */
