@@ -49,9 +49,12 @@ export interface AgentTurnResult {
   structured: ToolArgs | null;
   /**
    * Files the engine produced out-of-band (trueForge sandbox artifacts for the
-   * CODE agent). The caller bridges them into the pipeline workspace.
+   * CODE agent). The caller bridges them into the pipeline workspace. Text
+   * files carry `contents`; binary artifacts carry raw `bytes`.
    */
-  sandboxFiles?: Array<{ path: string; contents: string }>;
+  sandboxFiles?: Array<{ path: string; contents: string; bytes?: Uint8Array }>;
+  /** Set when the out-of-band bridge is incomplete (partial project). */
+  sandboxIncomplete?: string;
 }
 
 let _tfClient: TrueForge | null = null;
@@ -85,6 +88,7 @@ export async function runAgentTurn(p: AgentTurnParams): Promise<AgentTurnResult>
       text: r.text,
       structured: r.structured as ToolArgs | null,
       sandboxFiles: r.sandboxFiles,
+      sandboxIncomplete: r.sandboxIncomplete,
     };
   }
 

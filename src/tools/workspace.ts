@@ -108,7 +108,7 @@ export class Workspace {
     return p;
   }
 
-  async writeFile(path: string, contents: string): Promise<string> {
+  async writeFile(path: string, contents: string | Uint8Array): Promise<string> {
     const p = this.abs(path);
     mkdirSync(dirname(p), { recursive: true });
     await Bun.write(p, contents);

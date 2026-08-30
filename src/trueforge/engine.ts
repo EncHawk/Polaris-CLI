@@ -28,9 +28,17 @@ export interface TrueForgeTurnResult {
   /**
    * Files the agent created in the trueForge sandbox (from the assistant's
    * `sandbox_artifacts` block), downloaded back so the caller can bridge them
-   * into the pipeline workspace. Only present for sandboxed (CODE) turns.
+   * into the pipeline workspace. Text files carry `contents`; binary
+   * artifacts (images, checkpoints, archives, data) carry raw `bytes` so they
+   * aren't corrupted by a lossy UTF-8 round-trip.
    */
-  sandboxFiles?: Array<{ path: string; contents: string }>;
+  sandboxFiles?: Array<{ path: string; contents: string; bytes?: Uint8Array }>;
+  /**
+   * Set when the sandbox bridge is incomplete (artifacts beyond the cap, or
+   * skipped/failed downloads) so the caller can fail the run instead of
+   * publishing a partial project as a success.
+   */
+  sandboxIncomplete?: string;
 }
 
 /** Max sandbox files bridged per turn / max bytes per file. */
@@ -213,9 +221,14 @@ export async function runTrueForgeAgentTurn(
   // publish it. Without this, files stay stranded in the sandbox and the run
   // reports "code produced no output". Downloads use the absolute sandbox
   // paths (as the API requires); the workspace gets project-relative paths.
-  const sandboxFiles: Array<{ path: string; contents: string }> = [];
+  // Binary artifacts keep their raw bytes; a partial bridge is surfaced via
+  // `sandboxIncomplete` instead of being published as a complete project.
+  const sandboxFiles: Array<{ path: string; contents: string; bytes?: Uint8Array }> = [];
+  let bridgeMissing = 0;
+  const missingPaths: string[] = [];
   if (sandboxPaths.size > 0 && turnId) {
-    const originals = [...sandboxPaths].slice(0, MAX_SANDBOX_FILES);
+    const all = [...sandboxPaths];
+    const originals = all.slice(0, MAX_SANDBOX_FILES);
     const projectPaths = stripSandboxRoot(originals);
     for (let i = 0; i < originals.length; i++) {
       const absPath = originals[i]!;
@@ -224,14 +237,26 @@ export async function runTrueForgeAgentTurn(
         const resp = await client.sessions.downloadSandboxFile(session.id, turnId, { path: absPath });
         const buf = await resp.arrayBuffer();
         if (buf.byteLength > MAX_SANDBOX_FILE_BYTES) {
+          bridgeMissing++;
+          missingPaths.push(projectPath);
           step(p.jobUuid, p.agentEnum, "sandbox-bridge-skip", {
             tool: "trueforge:sandbox",
             conclusion: `skipped ${projectPath} (${buf.byteLength} bytes > ${MAX_SANDBOX_FILE_BYTES})`,
           });
           continue;
         }
-        sandboxFiles.push({ path: projectPath, contents: new TextDecoder("utf-8", { fatal: false }).decode(buf) });
+        let contents = "";
+        let bytes: Uint8Array | undefined;
+        try {
+          contents = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+        } catch {
+          // Not valid UTF-8 → binary artifact; keep raw bytes.
+          bytes = new Uint8Array(buf);
+        }
+        sandboxFiles.push(bytes ? { path: projectPath, contents: "", bytes } : { path: projectPath, contents });
       } catch (e) {
+        bridgeMissing++;
+        missingPaths.push(projectPath);
         step(p.jobUuid, p.agentEnum, "sandbox-bridge-skip", {
           tool: "trueforge:sandbox",
           conclusion: `failed to download ${projectPath}: ${(e as Error).message}`,
@@ -246,6 +271,20 @@ export async function runTrueForgeAgentTurn(
       });
     }
   }
+  let sandboxIncomplete: string | undefined;
+  if (sandboxPaths.size > 0) {
+    const total = sandboxPaths.size;
+    if (total > MAX_SANDBOX_FILES || bridgeMissing > 0) {
+      sandboxIncomplete =
+        `sandbox bridge incomplete: bridged ${sandboxFiles.length} of ${total} artifacts` +
+        (total > MAX_SANDBOX_FILES ? ` (capped at ${MAX_SANDBOX_FILES})` : "") +
+        (bridgeMissing > 0 ? ` — missing: ${missingPaths.slice(0, 10).join(", ")}` : "");
+      step(p.jobUuid, p.agentEnum, "sandbox-bridge-incomplete", {
+        tool: "trueforge:sandbox",
+        conclusion: sandboxIncomplete,
+      });
+    }
+  }
 
-  return { text: lastText, structured, status, sandboxFiles };
+  return { text: lastText, structured, status, sandboxFiles, sandboxIncomplete };
 }

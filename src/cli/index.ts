@@ -222,6 +222,12 @@ async function ensureTrueForgeForRun(): Promise<() => void> {
   const startMcpEndpoint = () =>
     Bun.serve({
       port: s.POLARIS_MCP_PORT,
+      // Loopback only: this endpoint exposes polaris_run (auto-approved CODE
+      // turns that execute shell commands) and auth is optional — binding all
+      // interfaces would let network peers drive code execution and burn the
+      // BYOK key. Remote harnesses reach it through the user's own
+      // proxy/tunnel in front of POLARIS_MCP_PUBLIC_URL.
+      hostname: "127.0.0.1",
       routes: { "/mcp": mcpRouteHandler(Bun.env["POLARIS_MCP_SECRET"]) },
       fetch: () => new Response("Not found", { status: 404 }),
     });

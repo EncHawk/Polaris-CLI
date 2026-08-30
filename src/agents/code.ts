@@ -336,14 +336,19 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
 
   // trueForge engine: bridge the sandbox artifacts into the pipeline workspace
   // so the files are persisted, checkpointed, and published exactly like
-  // locally-written files.
+  // locally-written files. Binary artifacts keep their raw bytes (no lossy
+  // UTF-8 round-trip); only text files go into the JSON checkpoint.
   for (const f of result.sandboxFiles ?? []) {
     try {
-      await workspace.writeFile(f.path, f.contents);
-      if (!codeFiles.some((cf) => cf.path === f.path)) codeFiles.push({ path: f.path, contents: f.contents });
-      const allFiles: Record<string, string> = {};
-      for (const cf of codeFiles) allFiles[cf.path] = cf.contents;
-      saveCodeCheckpoint(userId, paperId, jobUuid, allFiles);
+      await workspace.writeFile(f.path, f.bytes ?? f.contents);
+      if (!codeFiles.some((cf) => cf.path === f.path)) {
+        codeFiles.push({ path: f.path, contents: f.bytes ? "" : f.contents });
+      }
+      if (!f.bytes) {
+        const allFiles: Record<string, string> = {};
+        for (const cf of codeFiles) if (cf.contents) allFiles[cf.path] = cf.contents;
+        saveCodeCheckpoint(userId, paperId, jobUuid, allFiles);
+      }
     } catch (e) {
       step(jobUuid, "CODE", "sandbox-bridge-write-failed", {
         tool: "workspace",
@@ -395,6 +400,11 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   }
 
   deleteCheckpoints(jobUuid);
+
+  // A partial sandbox bridge (artifacts over the cap, or skipped/failed
+  // downloads) must surface as a run failure — publishing a repo that's
+  // missing required source/assets as a success would be worse than failing.
+  if (result.sandboxIncomplete && !pushError) pushError = result.sandboxIncomplete;
 
   const d = (data ?? {}) as Record<string, unknown>;
   const code: CodeOutput = {

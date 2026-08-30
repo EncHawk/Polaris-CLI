@@ -77,6 +77,12 @@ Also fixed while in there: `POLARIS_TRUEFORGE_BASE_URL ?? url` empty-string fall
 7. **Failed trueForge startup leaked servers** (Medium) — `ensureTrueForgeForRun` wraps harness start + provisioning in one try/catch that stops everything it started before rethrowing.
 8. **Sync writes** (Medium, rule) — workspace marker + test fixtures use `Bun.write` instead of `writeFileSync`.
 
+#### Qodo re-review round 3 (3 new findings — all fixed)
+
+1. **Standalone MCP endpoint bound all interfaces** (High, security) — the CLI MCP endpoint now binds `127.0.0.1` only: it exposes `polaris_run` (auto-approved CODE turns that execute shell commands) with optional auth, so a 0.0.0.0 bind would let network peers drive host code execution and burn the BYOK key. Remote harnesses reach it through the user's proxy/tunnel in front of `POLARIS_MCP_PUBLIC_URL`.
+2. **Binary artifacts corrupted by UTF-8 decode** (High) — the bridge decodes with `fatal: true` and keeps raw `bytes` for anything that isn't valid UTF-8 (images, checkpoints, archives, data); `Workspace.writeFile` accepts `string | Uint8Array`, and binary files are excluded from the JSON checkpoint.
+3. **Partial bridge published as success** (Medium) — artifact-cap truncation and skipped/failed downloads now surface as `sandboxIncomplete`, which sets `push_error` and fails the run instead of publishing a repo that's missing required files.
+
 ### Key design decisions
 
 1. **Two engines, one pipeline**: the graph/agents are engine-agnostic. The local ReAct loop (`loop.ts`) and the trueForge engine (`engine.ts`) both consume the same prompts + tool defs and emit to the same trace bus.
