@@ -17,7 +17,7 @@ polaris serve --tf          # start agent-server + trueForge (web UI + API + MCP
 ## Global installation (npm)
 
 ```bash
-npm i -g polaris-cli-enchawk # requires bun on your PATH (the CLI runs on Bun)
+npm i -g polarisai # requires bun on your PATH (the CLI runs on Bun)
 polaris start                # boots trueForge + APIs straight away and opens interactive TUI
 ```
 

@@ -124,6 +124,10 @@ async function gateCode(state: WorkerState): Promise<Node> {
   const codeOut = state.code;
   // CODE failures are terminal here — VERIFY runs only after files have been
   // produced locally and the implementation reported itself ready.
+  // No external publishing (GitHub) happens in CODE; the workspace is local-only.
+  // VERIFY therefore gates the final status, not a post-publish check — a failed
+  // verify marks the job failed (see gateVerify) and never leaves a published
+  // artifact as "success" in any external registry.
   if (!codeOut || !codeOut.ready) return "failed";
   if (runsOf(state, "CODE") >= MAX_GATE_RETRIES || isStuckRepeat(state, "CODE", codeOut)) {
     delete state.orchestrator_feedback;
@@ -140,7 +144,11 @@ async function gateVerify(state: WorkerState): Promise<Node> {
   const v = state.verify;
   if (!v || !v.ready) return "failed";
   // A strict verify failure is terminal — the run's code didn't persist the
-  // required signals. The user can fix via `:modify`/`:rerun` in the chat TUI.
+  // required signals. The local workspace remains on disk for :modify/:rerun,
+  // but the job is marked failed and no external "success" publication occurs
+  // (Polaris keeps implementations local; it never auto-pushes to PolarisAI-Implementations).
+  // This ordering intentionally verifies BEFORE any hypothetical external publish, so an
+  // unverified implementation is never presented as done.
   if (v.checks_passed === false) {
     state.error = v.missing_signals?.join("; ") || v.output_query || "verify failed";
     error(state.job_uuid, "VERIFY", state.error);

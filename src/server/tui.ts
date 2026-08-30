@@ -47,6 +47,11 @@ const DIM = "\x1b[2m";
 const REV = "\x1b[7m";
 const UNDER = "\x1b[4m";
 
+class InterruptedError extends Error {
+  exitCode = 130;
+  constructor(msg = "interrupted") { super(msg); this.name = "InterruptedError"; }
+}
+
 const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
 
 /** Visible width of an ANSI-styled string. */
@@ -138,12 +143,14 @@ async function runLineTui(job: Job): Promise<void> {
     console.log(`${C.WARN}BYOK not configured — set POLARIS_API_KEY (or run in a TTY for the setup wizard)${RESET}\n`);
   }
 
-  let approvalHandled = false;
+  let approvalPending = false;
   const unsub = traceBus.subscribe(jobUuid(job), (ev) => {
     console.log(renderTraceLine(ev));
-    if (ev.kind === "AWAIT_USER" && !approvalHandled && !job.auto_approve) {
-      approvalHandled = true;
-      promptApprovalLineMode(jobUuid(job)).catch(() => {});
+    if (ev.kind === "AWAIT_USER" && !approvalPending && !job.auto_approve) {
+      approvalPending = true;
+      promptApprovalLineMode(jobUuid(job))
+        .catch(() => {})
+        .finally(() => { approvalPending = false; });
     }
   });
   const final = await runOne(job);
@@ -221,6 +228,8 @@ class ChatTui {
   private headerRight = "";
   private pendingApproval: string | null = null;
   private commandResolver: ((cmd: string) => void) | null = null;
+  private commandReject: ((err: Error) => void) | null = null;
+  private pendingInterrupt: Error | null = null;
   private disposed = false;
   private escBuf = "";
   private decoder = new TextDecoder("utf-8", { fatal: false });
@@ -417,8 +426,14 @@ class ChatTui {
 
   /** Resolves on the next submitted input while in `done`/`running` mode. */
   readCommand(): Promise<string> {
-    return new Promise((resolve) => {
+    if (this.pendingInterrupt) {
+      const err = this.pendingInterrupt;
+      this.pendingInterrupt = null;
+      return Promise.reject(err);
+    }
+    return new Promise((resolve, reject) => {
       this.commandResolver = resolve;
+      this.commandReject = reject;
     });
   }
 
@@ -450,7 +465,7 @@ class ChatTui {
     if (this.mode === "help") {
       for (const ch of decoded) {
         if (ch === "\x1b" || ch === "q" || ch === "\r" || ch === "\n" || ch === "\x03") {
-          if (ch === "\x03") { this.dispose(); process.exit(130); }
+          if (ch === "\x03") { this.handleInterrupt(); return; }
           this.mode = "done";
           this.setHints(":rerun [feedback] · :modify <feedback> · :path · :settings provider · :help · :q quit");
           this.render();
@@ -467,11 +482,11 @@ class ChatTui {
     for (const ch of decoded) {
       if (this.escBuf) {
         this.escBuf += ch;
-        // arrow keys, page up/down, F1 etc
-        if (this.escBuf === "\x1b[A") this.scroll(-1);
-        else if (this.escBuf === "\x1b[B") this.scroll(1);
-        else if (this.escBuf === "\x1b[5~") this.scroll(-Math.max((process.stdout.rows ?? 24)-5, 10)); // PgUp
-        else if (this.escBuf === "\x1b[6~") this.scroll(Math.max((process.stdout.rows ?? 24)-5, 10)); // PgDn
+        // arrow keys, page up/down, F1 etc — view=0 is bottom, larger view = older lines, so Up/PgUp increase view
+        if (this.escBuf === "\x1b[A") this.scroll(1);
+        else if (this.escBuf === "\x1b[B") this.scroll(-1);
+        else if (this.escBuf === "\x1b[5~") this.scroll(Math.max((process.stdout.rows ?? 24)-5, 10)); // PgUp
+        else if (this.escBuf === "\x1b[6~") this.scroll(-Math.max((process.stdout.rows ?? 24)-5, 10)); // PgDn
         else if (this.escBuf === "\x1bOP" || this.escBuf === "\x1b[11~") this.openHelp(); // F1
         if (this.escBuf.length >= 3 || /[A-D~P]/.test(ch)) this.escBuf = "";
         continue;
@@ -481,11 +496,34 @@ class ChatTui {
       if (ch === "\x13") { this.openSettings(); continue; }
       if (ch === "\r" || ch === "\n") { this.submit(); continue; }
       if (ch === "\x7f" || ch === "\b") { this.input = this.input.slice(0, -1); this.render(); continue; }
-      if (ch === "\x03") { this.dispose(); process.exit(130); }
+      if (ch === "\x03") { this.handleInterrupt(); return; }
       if (ch === "\t" || ch < " ") continue;
       this.input += ch;
       this.render();
     }
+  }
+
+  private handleInterrupt(): void {
+    // Signal cancellation should unwind through existing finally blocks and preserve exit code 130 after cleanup.
+    // Do not call process.exit directly — let runTui / cmdStart finally blocks stop the TrueForge harness.
+    this.dispose();
+    process.exitCode = 130;
+    const err = new InterruptedError("Ctrl-C");
+    if (this.commandReject) {
+      const rej = this.commandReject;
+      this.commandResolver = null;
+      this.commandReject = null;
+      rej(err);
+    } else if (this.commandResolver) {
+      const res = this.commandResolver;
+      this.commandResolver = null;
+      this.commandReject = null;
+      res(":q");
+    } else {
+      // No one is waiting (e.g. pipeline is running) — stash for next readCommand
+      this.pendingInterrupt = err;
+    }
+    // If readKeys loop is waiting, it will exit on next read due to disposed flag
   }
 
   private handleSettingsChunk(decoded: string): void {
@@ -504,7 +542,7 @@ class ChatTui {
         continue;
       }
       if (ch === "\x1b") { this.escBuf = "\x1b"; continue; }
-      if (ch === "\x03") { this.dispose(); process.exit(130); }
+      if (ch === "\x03") { this.handleInterrupt(); return; }
       if (ch === "\x13") { // Ctrl+S save
         this.saveSettings(); continue;
       }
@@ -1006,6 +1044,12 @@ export async function runTui(job: Job): Promise<void> {
       current = buildFollowUpJob(job, current, lastFinal!, followUp);
       tui.add(`${C.SYSTEM}${BOLD}── new run ──${RESET}`);
     }
+  } catch (e) {
+    if ((e as Error)?.name === "InterruptedError" || (e as unknown as { exitCode?: number })?.exitCode === 130) {
+      process.exitCode = 130;
+      return;
+    }
+    throw e;
   } finally {
     tui.dispose();
   }

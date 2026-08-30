@@ -143,7 +143,18 @@ export async function runVerify(state: WorkerState): Promise<Partial<WorkerState
 
   const plan = state.plan ?? {};
   const read = state.read ?? {};
-  const planBlob = JSON.stringify(
+  // Do not silently truncate verification evidence — VERIFY must check every signal.
+  // Previous 6k slicing dropped tail entries (planned files, deltas, citations) and could falsely pass.
+  // Now we send the full structured blobs (plans are typically <8k; even large ones are <30k, well within LLM limits).
+  // If they ever exceed a generous cap, we explicitly mark truncation instead of silently dropping tail data.
+  const MAX_VERIFY_BLOB = 25000;
+  function formatBlob(obj: unknown, label: string): string {
+    const full = JSON.stringify(obj, null, 2);
+    if (full.length <= MAX_VERIFY_BLOB) return full;
+    const head = full.slice(0, MAX_VERIFY_BLOB);
+    return head + `\n...[TRUNCATED: ${label} was ${full.length} chars, truncated to ${MAX_VERIFY_BLOB}. VERIFY must list remaining signals as missing and request manual review.]`;
+  }
+  const planBlob = formatBlob(
     {
       intends_to_prove: plan.intends_to_prove,
       proof_method: plan.proof_method,
@@ -151,10 +162,9 @@ export async function runVerify(state: WorkerState): Promise<Partial<WorkerState
       plan: plan.plan,
       custom_kernels: plan.custom_kernels,
     },
-    null,
-    2,
-  ).slice(0, 6000);
-  const readBlob = JSON.stringify(
+    "PLAN",
+  );
+  const readBlob = formatBlob(
     {
       aim: read.aim,
       novel_approach: read.novel_approach,
@@ -163,9 +173,8 @@ export async function runVerify(state: WorkerState): Promise<Partial<WorkerState
       built_on: read.built_on,
       experiments: read.experiments,
     },
-    null,
-    2,
-  ).slice(0, 6000);
+    "READ",
+  );
 
   // Snapshot of what's already on disk (for prompt context).
   let preList = "";
@@ -199,11 +208,11 @@ export async function runVerify(state: WorkerState): Promise<Partial<WorkerState
     },
   };
 
-  const feedbackBlob = JSON.stringify({
+  const feedbackBlob = formatBlob({
     plan_feedback: state.plan_feedback ?? "",
     orchestrator_feedback: state.orchestrator_feedback ?? "",
     code_feedback: (state as unknown as { code_feedback?: string }).code_feedback ?? "",
-  }, null, 2).slice(0, 2000);
+  }, "FEEDBACK");
 
   const userMessage =
     `PAPER: https://arxiv.org/abs/${state.arxiv_id ?? ""}\n\n` +

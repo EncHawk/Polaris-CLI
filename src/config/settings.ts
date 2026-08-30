@@ -10,6 +10,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
+// Bun-native file I/O (Bun.file) is async, but getSettings() is a synchronous
+// hot path called before any async context is available and the global env file
+// is tiny (<10KB). Using node:fs sync APIs here is intentional and documented
+// as the incompatible edge case: Bun.file would require making the entire
+// settings pipeline async for no benefit.
+
 const env: Record<string, string | undefined> = Bun.env as Record<string, string | undefined>;
 
 /** Parse a .env-style file into KEY=VALUE pairs (comments + quotes handled). */

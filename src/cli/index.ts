@@ -45,7 +45,6 @@ ENV  (see .env.example)
   POLARIS_PORT, POLARIS_MCP_PORT, POLARIS_TRUEFORGE_PORT    (ports)
   POLARIS_MCP_PUBLIC_URL                                    (remote trueForge harness MCP URL)
   POLARIS_MAX_UPLOAD_MB, POLARIS_MAX_PAPER_CHARS            (upload limits)
-  DAYTONA_API_KEY                                           (optional)
 `;
 
 export async function main(argv: string[]): Promise<void> {

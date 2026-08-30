@@ -69,8 +69,31 @@ function toTfInput(history: ChatMessage[]): TrueForgeApi.TurnInputItem[] {
 }
 
 export async function runAgentTurn(p: AgentTurnParams): Promise<AgentTurnResult> {
-  // Forced TrueForge: all agent turns go through the harness. The local
-  // loop is retained only for unit-test reference and is never used in prod.
+  // VERIFY must run locally even when engine is trueforge: it needs to read
+  // the pipeline's local workspace (Workshop bridged files), not the trueForge
+  // sandbox. TrueForge's MCP + sandbox cannot execute local read_file/list_files/run_command
+  // handlers, so routing VERIFY through the harness would silently drop its tools.
+  if (p.agentEnum === "VERIFY" || p.agentName.toUpperCase() === "VERIFY") {
+    const text = await runAgenticCall({
+      agentName: p.agentName,
+      systemPrompt: p.systemPrompt,
+      userMessage: p.userMessage,
+      tools: p.tools,
+      toolHandlers: p.toolHandlers,
+      jobUuid: p.jobUuid,
+      agentEnum: p.agentEnum,
+      model: p.model,
+      maxTokens: p.maxTokens,
+      conversationHistory: p.conversationHistory,
+      maxIterations: p.maxIterations,
+    });
+    // Structured output is captured via the verify handler's side-effect (data variable in caller).
+    // Return no structured here; caller falls back to handler-captured data.
+    return { text, structured: null };
+  }
+
+  // Forced TrueForge: all other agent turns go through the harness. The local
+  // loop is retained only for VERIFY and unit-test reference.
   const completionTool = COMPLETION_TOOL[p.agentName.toUpperCase()];
 
   // Always route through TrueForge harness (local is aliased)
