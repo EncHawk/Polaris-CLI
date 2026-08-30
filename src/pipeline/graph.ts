@@ -49,7 +49,7 @@ function failed(state: WorkerState): void {
   state.status = "failed";
 }
 
-type Node = "read" | "research" | "plan" | "code" | "verify" | "failed" | typeof END;
+type Node = "read" | "research" | "plan" | "code" | "verify" | "publish" | "failed" | typeof END;
 
 async function runNode(state: WorkerState, node: Exclude<Node, typeof END | "failed">): Promise<void> {
   step(state.job_uuid, "SYSTEM", `enter-${node}`, { tool: "graph", conclusion: node });
@@ -69,6 +69,13 @@ async function runNode(state: WorkerState, node: Exclude<Node, typeof END | "fai
       break;
     case "verify":
       update = await runVerify(state);
+      break;
+    case "publish":
+      // Local-only publication: no GitHub push happens automatically. The workspace
+      // remains at state.code.workspace_path; external publish (e.g., to
+      // PolarisAI-Implementations) would be an explicit manual step after VERIFY.
+      step(state.job_uuid, "SYSTEM", "enter-publish", { tool: "graph", conclusion: "local publish (no external push)" });
+      update = {};
       break;
   }
   Object.assign(state, update);
@@ -147,7 +154,7 @@ async function gateVerify(state: WorkerState): Promise<Node> {
   // required signals. The local workspace remains on disk for :modify/:rerun,
   // but the job is marked failed and no external "success" publication occurs
   // (Polaris keeps implementations local; it never auto-pushes to PolarisAI-Implementations).
-  // This ordering intentionally verifies BEFORE any hypothetical external publish, so an
+  // This ordering intentionally verifies BEFORE any external publish, so an
   // unverified implementation is never presented as done.
   if (v.checks_passed === false) {
     state.error = v.missing_signals?.join("; ") || v.output_query || "verify failed";
@@ -155,6 +162,17 @@ async function gateVerify(state: WorkerState): Promise<Node> {
     status(state.job_uuid, "failed");
     return "failed";
   }
+  // Verification passed — proceed to explicit publish step (local-only, no-op).
+  // External publication, if ever enabled, would be gated here, after verification.
+  return "publish";
+}
+
+async function gatePublish(state: WorkerState): Promise<Node> {
+  // Separate code generation from publication: VERIFY has already run against the
+  // local workspace. Publication (if enabled) would happen here, only after
+  // verification passes. Currently Polaris keeps implementations local, so this
+  // is a no-op that just records the publish gate.
+  void state;
   return END;
 }
 
@@ -164,6 +182,7 @@ const GATES: Record<Exclude<Node, typeof END | "failed">, (s: WorkerState) => Pr
   plan: gatePlan,
   code: gateCode,
   verify: gateVerify,
+  publish: gatePublish,
 };
 
 /** Drive the pipeline to completion and return the final state. */

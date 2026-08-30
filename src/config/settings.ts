@@ -6,15 +6,8 @@
  * directories, so we also load `~/.polaris/.env` as a global credential file —
  * values already present (cwd `.env`, real environment) always win.
  */
-import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-
-// Bun-native file I/O (Bun.file) is async, but getSettings() is a synchronous
-// hot path called before any async context is available and the global env file
-// is tiny (<10KB). Using node:fs sync APIs here is intentional and documented
-// as the incompatible edge case: Bun.file would require making the entire
-// settings pipeline async for no benefit.
 
 const env: Record<string, string | undefined> = Bun.env as Record<string, string | undefined>;
 
@@ -37,18 +30,34 @@ export function parseEnvFile(text: string): Record<string, string> {
 }
 
 let _globalLoaded = false;
-function loadGlobalEnvFile(): void {
+async function loadGlobalEnvFileAsync(): Promise<void> {
   if (_globalLoaded) return;
   _globalLoaded = true;
   try {
     const path = join(homedir(), ".polaris", ".env");
-    if (!existsSync(path)) return;
-    for (const [k, v] of Object.entries(parseEnvFile(readFileSync(path, "utf-8")))) {
+    const file = Bun.file(path);
+    if (!(await file.exists())) return;
+    const text = await file.text();
+    for (const [k, v] of Object.entries(parseEnvFile(text))) {
       if (env[k] == null) env[k] = v;
     }
   } catch {
     /* a config file must never break the CLI */
   }
+}
+
+// Eagerly load the global env file via Bun-native async I/O at module init (top-level await).
+// This preserves the existing synchronous getSettings() hot path — by the time any caller
+// invokes getSettings(), the await has already completed. The fallback sync wrapper below
+// handles rare edge cases (e.g., tests resetting _globalLoaded) by triggering the async
+// loader without blocking.
+await loadGlobalEnvFileAsync();
+
+function loadGlobalEnvFile(): void {
+  if (_globalLoaded) return;
+  // Rare fallback: trigger async reload without blocking; precedence still preserved
+  // because parseEnvFile skips keys already in Bun.env.
+  void loadGlobalEnvFileAsync();
 }
 
 /** Location of the global config file (for doctor output). */
