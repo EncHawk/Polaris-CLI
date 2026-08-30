@@ -74,7 +74,7 @@ export function extractSandboxPaths(content: unknown): string[] {
  * one shared leading directory that directory is the sandbox working root —
  * not part of the project — so it's stripped, and files land at their
  * project-relative locations (`train.py`) instead of under an unwanted
- * `workspace/` directory in the published repo.
+ * `workspace/` directory in the local project.
  */
 export function stripSandboxRoot(absPaths: string[]): string[] {
   const rels = absPaths.map((p) => p.replace(/^\/+/, ""));
@@ -222,7 +222,7 @@ export async function runTrueForgeAgentTurn(
   // reports "code produced no output". Downloads use the absolute sandbox
   // paths (as the API requires); the workspace gets project-relative paths.
   // Binary artifacts keep their raw bytes; a partial bridge is surfaced via
-  // `sandboxIncomplete` instead of being published as a complete project.
+  // `sandboxIncomplete` instead of being reported as a complete project.
   const sandboxFiles: Array<{ path: string; contents: string; bytes?: Uint8Array }> = [];
   let bridgeMissing = 0;
   const missingPaths: string[] = [];

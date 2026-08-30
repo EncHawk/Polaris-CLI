@@ -22,6 +22,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.production.local
 .env.local
 
+tests
+tests/*
+
+
 # caches
 .eslintcache
 .cache
@@ -33,6 +37,11 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 *.npmrc
 .npmrc*
 .npmrc
+
+EXPLAIN.md
+NOTES.md
+next_task.md
+SPEC.md
 
 # Finder (MacOS) folder config
 .DS_Store

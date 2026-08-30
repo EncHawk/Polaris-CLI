@@ -1,14 +1,19 @@
 /**
- * Polaris MCP server — exposes the polaris agent tools over MCP so:
- *   - trueForge agents (read/research/plan/code) can call the completion tools
- *     and `search_arxiv` through trueForge's MCP tool routing
- *   - external coding agents (claude-code, codex, …) can call `polaris_run` to
- *     run the whole paper-reproduction pipeline with frontier models
+ * Polaris MCP server — **broker for document extraction** (READ → RESEARCH → PLAN).
+ * TrueForge is the forced harness; the MCP is only a broker so an external
+ * model can delegate paper extraction + planning to Polaris.
+ *
+ * Exposed tools (intentionally limited to READ/PLAN):
+ *   - complete_read_result / complete_research / complete_plan  (signal tools for TrueForge agents)
+ *   - search_arxiv                                            (citation lookup for RESEARCH)
+ *   - polaris_extract                                         (broker: extracts READ + PLAN via TrueForge)
+ *
+ * CODE / VERIFY and the full `polaris_run` pipeline are **not** exposed —
+ * the calling model does the implementation itself after receiving the plan.
+ * This keeps the MCP surface minimal and lets the user's own agent handle CODE.
  *
  * Runs as a streamable-HTTP server (Bun-compatible Web Standard transport) so it
- * works behind any MCP client. The completion tools are signal tools: their args
- * carry the agent's structured output, which the TrueForgeEngine reads from the
- * model.message event stream.
+ * works behind any MCP client.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
@@ -16,14 +21,9 @@ import {
 } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import { searchId, searchTitle } from "../tools/arxiv.ts";
-import {
-  searchPolarisPapers,
-  getImplementation,
-  getImplementationFile,
-  arxivIdToRepoName,
-} from "../tools/papers.ts";
-import { runOne } from "../pipeline/run.ts";
+import { runExtraction } from "../pipeline/run.ts";
 import { getSettings } from "../config/settings.ts";
+import { extractPaperText } from "../tools/upload.ts";
 
 const SERVER_INFO = { name: "polaris", version: "0.1.0" };
 
@@ -34,7 +34,7 @@ export interface McpServerOptions {
 export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
   const server = new McpServer(SERVER_INFO, {
     instructions:
-      "Polaris AI paper-reproduction pipeline (READ → RESEARCH → PLAN → CODE → VERIFY). Agents call complete_* / mark_implementation_complete / complete_verify to submit structured output, search_arxiv to look up citation metadata, and search_polaris_papers / get_polaris_implementation to retrieve an existing coded reproduction from the PolarisAI-Implementations library. External agents call polaris_run to reproduce an arXiv paper end-to-end.",
+      "Polaris AI extraction broker (READ → RESEARCH → PLAN via TrueForge). Agents call complete_read_result / complete_research / complete_plan to submit structured output and search_arxiv for citation metadata. External models call polaris_extract to delegate document extraction + planning to Polaris (TrueForge harness) and then implement CODE themselves.",
   });
 
   // ─── Completion signal tools (args carry the structured output) ──────────────
@@ -106,37 +106,6 @@ export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
     async () => ({ content: [{ type: "text", text: "Plan recorded. The plan is ready for user approval." }] }),
   );
 
-  server.registerTool(
-    "mark_implementation_complete",
-    {
-      description: "Call this when the implementation is fully done and working. Provide a summary of what was built.",
-      inputSchema: {
-        files_written: z.array(z.string()),
-        summary: z.string(),
-        test_results: z.string().optional(),
-        caveats: z.string().optional(),
-      },
-    },
-    async () => ({ content: [{ type: "text", text: "Implementation marked as complete." }] }),
-  );
-
-  server.registerTool(
-    "complete_verify",
-    {
-      description: "Call with your verification result once all checks are done — confirms the implementation persisted every signal from the initial paper intake and the plan.",
-      inputSchema: {
-        plan_signals_covered: z.array(z.string()).describe("Plan signals/deltas present in the implementation"),
-        missing_signals: z.array(z.string()).describe("Plan/initial signals missing or not persisted"),
-        initial_queries_covered: z.array(z.string()).describe("Initial READ / additional-query signals covered"),
-        files_verified: z.array(z.string()).describe("Files that exist and passed checks"),
-        files_missing: z.array(z.string()).describe("Planned files that are absent"),
-        checks_passed: z.boolean().describe("Overall pass/fail"),
-        output_query: z.string().describe("One-sentence summary"),
-      },
-    },
-    async () => ({ content: [{ type: "text", text: "Verification recorded." }] }),
-  );
-
   // ─── arxiv lookup (used by the RESEARCH agent) ───────────────────────────────
   server.registerTool(
     "search_arxiv",
@@ -162,141 +131,23 @@ export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
     },
   );
 
-  // ─── Polaris coded-implementation library (Phase 2) ──────────────────────────
-  // Lets coding agents retrieve the right coded paper reproduction from the
-  // PolarisAI-Implementations GitHub org based on what they're asking for.
+  // ─── Broker: document extraction + planning via TrueForge ───────────────────
+  // The user's own agent calls this to delegate READ → RESEARCH → PLAN to Polaris.
+  // It runs the harness (forced TrueForge) up to PLAN and returns the structured
+  // extraction so the model can do CODE itself. This is the only "run" tool
+  // exposed externally — CODE/VERIFY are intentionally not brokered.
   server.registerTool(
-    "search_polaris_papers",
+    "polaris_extract",
     {
       description:
-        "Search the Polaris coded-implementation library (github.com/" +
-        getSettings().POLARIS_PAPERS_ORG +
-        ") for an existing reproduction of a paper. " +
-        "Pass arxiv_id for a direct lookup, or a free-text query (topic/keyword) to rank all implementations. " +
-        "Returns matching repos with their arXiv id, description, and GitHub URL. " +
-        "Use this to discover whether a paper (or a citation it builds on) already has a coded implementation you can reuse.",
+        "Broker document extraction via Polaris (TrueForge harness). " +
+        "Takes an arXiv ID or raw paper markdown (or base64 PDF) and runs the Polaris READ → RESEARCH → PLAN pipeline on TrueForge, returning the structured extraction (aim, novel approach, experiments, citations, deltas, and the code plan). " +
+        "The calling model then implements CODE itself. This is the sole extraction entrypoint; Polaris does not expose CODE/VERIFY over MCP.",
       inputSchema: {
-        arxiv_id: z
-          .string()
-          .optional()
-          .describe("ArXiv ID to look up directly, e.g. 2106.09685"),
-        query: z
-          .string()
-          .optional()
-          .describe("Free-text search over repo names and descriptions (e.g. 'attention transformer', 'lora finetuning')"),
-        limit: z.number().optional().describe("Max results (default 10)"),
-      },
-    },
-    async (args) => {
-      try {
-        const matches = await searchPolarisPapers({
-          arxiv_id: args.arxiv_id,
-          query: args.query,
-          limit: args.limit,
-        });
-        if (matches.length === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({
-                  found: 0,
-                  org: getSettings().POLARIS_PAPERS_ORG,
-                  message: "No coded implementations matched. The paper may not have been reproduced yet.",
-                }),
-              },
-            ],
-          };
-        }
-        const summary = matches.map((m) => ({
-          arxiv_id: m.arxiv_id,
-          repo_name: m.repo_name,
-          description: m.description,
-          html_url: m.html_url,
-          updated_at: m.updated_at,
-          stars: m.stars,
-        }));
-        return { content: [{ type: "text", text: JSON.stringify({ found: matches.length, papers: summary }) }] };
-      } catch (e) {
-        return { isError: true, content: [{ type: "text", text: `search_polaris_papers failed: ${(e as Error).message}` }] };
-      }
-    },
-  );
-
-  server.registerTool(
-    "get_polaris_implementation",
-    {
-      description:
-        "Retrieve the full coded implementation for a paper from the Polaris library. " +
-        "Returns the file tree plus the contents of every source/code file. " +
-        "Pass arxiv_id or repo_name. Use single_file to fetch just one file path instead of the whole repo.",
-      inputSchema: {
-        arxiv_id: z
-          .string()
-          .optional()
-          .describe("ArXiv ID of the paper whose implementation to retrieve, e.g. 2106.09685"),
-        repo_name: z
-          .string()
-          .optional()
-          .describe("Repo name directly, e.g. paper-2106-09685"),
-        single_file: z
-          .string()
-          .optional()
-          .describe("If set, return only this single file path's contents instead of the whole repo"),
-        max_files: z
-          .number()
-          .optional()
-          .describe("Max number of file bodies to fetch when retrieving the whole repo (default 40)"),
-      },
-    },
-    async (args) => {
-      const s = getSettings();
-      try {
-        const repoName = args.repo_name || (args.arxiv_id ? arxivIdToRepoName(args.arxiv_id) : "");
-        if (!repoName) {
-          return { isError: true, content: [{ type: "text", text: "Provide either arxiv_id or repo_name." }] };
-        }
-        if (args.single_file) {
-          const content = await getImplementationFile(repoName, args.single_file);
-          return { content: [{ type: "text", text: JSON.stringify({ repo_name: repoName, path: args.single_file, content }) }] };
-        }
-        const impl = await getImplementation(repoName, args.max_files);
-        return { content: [{ type: "text", text: JSON.stringify(impl) }] };
-      } catch (e) {
-        return { isError: true, content: [{ type: "text", text: `get_polaris_implementation failed: ${(e as Error).message}` }] };
-      }
-    },
-  );
-
-  // ─── Full pipeline (for external coding agents: claude-code, codex, …) ───────
-  server.registerTool(
-    "polaris_run",
-    {
-      description:
-        "Run the full Polaris paper-reproduction pipeline (READ -> RESEARCH -> PLAN -> CODE -> VERIFY) for an arXiv paper or an uploaded paper's text. " +
-        "First checks the Polaris coded-implementation library for an existing reproduction; if found and reuse_if_exists=true, returns the existing repo. " +
-        "Otherwise generates the code with the BYOK LLM (or trueForge harness) and pushes it to GitHub. " +
-        "Auto-approves the plan (non-interactive). Requires POLARIS_API_KEY (BYOK) on the polaris CLI host.",
-      inputSchema: {
-        arxiv_id: z.string().optional().describe("ArXiv paper id, e.g. 2301.12345 (required if markdown is not given)"),
-        markdown: z
-          .string()
-          .optional()
-          .describe("Paper text as markdown (e.g. extracted from an uploaded PDF). Pass this instead of arxiv_id to reproduce a paper from its file contents."),
-        engine: z
-          .enum(["local", "trueforge"])
-          .optional()
-          .describe("local (default) = BYOK ReAct agents; trueforge = run via the trueForge harness"),
-        reuse_if_exists: z
-          .boolean()
-          .optional()
-          .describe("If true and an existing coded implementation is found in the library, reuse it instead of regenerating (default false)"),
-        repo_name: z.string().optional().describe("Optional target GitHub repo name"),
-        execution_mode: z
-          .enum(["create", "modify", "run"])
-          .optional()
-          .describe("create (default) = new repo; modify = edit existing; run = just run reproduce.py"),
-        top_n_citations: z.number().optional().describe("Max citations the RESEARCH agent researches (default 8)"),
+        arxiv_id: z.string().optional().describe("ArXiv paper id, e.g. 2301.12345 (required if markdown not given)"),
+        markdown: z.string().optional().describe("Paper text as markdown (e.g. extracted from PDF). Pass instead of arxiv_id."),
+        pdf_base64: z.string().optional().describe("Raw PDF as base64 (alternative to markdown) — server will extract text"),
+        top_n_citations: z.number().optional().describe("Max citations to research (default 8)"),
       },
     },
     async (args) => {
@@ -304,36 +155,38 @@ export function createPolarisMcpServer(opts: McpServerOptions = {}): McpServer {
       if (!s.POLARIS_API_KEY) {
         return {
           isError: true,
-          content: [{ type: "text", text: "POLARIS_API_KEY is not set on the polaris host (BYOK required)." }],
+          content: [{ type: "text", text: "POLARIS_API_KEY is not set on the Polaris host (BYOK required)." }],
         };
       }
-      if (!args.arxiv_id && !args.markdown) {
-        return { isError: true, content: [{ type: "text", text: "Provide either arxiv_id or markdown." }] };
+      if (!args.arxiv_id && !args.markdown && !args.pdf_base64) {
+        return { isError: true, content: [{ type: "text", text: "Provide either arxiv_id, markdown, or pdf_base64." }] };
       }
       try {
-        const final = await runOne({
+        let markdown = args.markdown;
+        if (!markdown && args.pdf_base64) {
+          const buf = Buffer.from(args.pdf_base64, "base64");
+          const extracted = await extractPaperText("paper.pdf", buf);
+          markdown = extracted.markdown;
+        }
+        const final = await runExtraction({
           arxiv_id: args.arxiv_id,
-          markdown: args.markdown,
-          engine: args.engine ?? "local",
-          reuse_if_exists: args.reuse_if_exists ?? false,
-          repo_name: args.repo_name,
-          execution_mode: args.execution_mode,
+          markdown,
+          engine: "trueforge",
           top_n_citations: args.top_n_citations,
           auto_approve: true,
-        });
-        const code = final.code ?? {};
-        const reused = Boolean(final.library_hit && (final.status === "done") && !code.files?.length);
-        const text =
-          `status: ${final.status ?? "done"}${reused ? " (reused existing)" : ""}\n` +
-          `github_url: ${code.github_url ?? ""}\n` +
-          `repo_name: ${code.repo_name ?? ""}\n` +
-          (final.library_hit ? `library_hit: ${final.library_hit.repo_name}\n` : "") +
-          (code.push_error ? `push_error: ${code.push_error}\n` : "") +
-          (final.error ? `error: ${final.error}\n` : "") +
-          `files: ${(code.files ?? []).map((f) => f.path).join(", ")}`;
-        return { content: [{ type: "text", text }] };
+        } as any);
+        const out = {
+          status: final.status,
+          arxiv_id: final.arxiv_id,
+          read: final.read,
+          research: final.research,
+          plan: final.plan,
+          error: final.error ?? undefined,
+          // Explicitly omit code/verify — caller does those via its own harness
+        };
+        return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
       } catch (e) {
-        return { isError: true, content: [{ type: "text", text: `polaris_run failed: ${(e as Error).message}` }] };
+        return { isError: true, content: [{ type: "text", text: `polaris_extract failed: ${(e as Error).message}` }] };
       }
     },
   );

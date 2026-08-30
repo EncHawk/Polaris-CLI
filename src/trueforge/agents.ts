@@ -1,7 +1,7 @@
 /**
  * Polaris agents expressed as trueForge AgentSpecs — the manifests `polaris setup`
  * saves into the trueForge registry. Each agent reuses the ported polaris system
- * prompt and attaches the polaris MCP server (completion + arxiv + github tools).
+ * prompt and attaches the polaris MCP server (completion + arxiv + library tools).
  * The CODE agent additionally gets trueForge's sandbox-as-tool.
  */
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";

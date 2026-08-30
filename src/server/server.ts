@@ -7,12 +7,13 @@
  *
  * This is the opencode-style single agent-server: one process, TUI + web + API.
  */
-import index from "./web/index.html";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { runOne } from "../pipeline/run.ts";
 import { traceBus, type TraceEvent } from "../pipeline/trace.ts";
 import { approvalGate } from "../pipeline/approval.ts";
 import { mcpRouteHandler } from "../mcp/server.ts";
-import { getSettings } from "../config/settings.ts";
+import { byokStatus, getSettings, setRuntimeByok } from "../config/settings.ts";
 import { searchPolarisPapers, getImplementation, getImplementationFile, arxivIdToRepoName } from "../tools/papers.ts";
 import { extractPaperText, type ExtractResult } from "../tools/upload.ts";
 import { makeTrueForgeClient } from "../trueforge/client.ts";
@@ -89,11 +90,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   const server = Bun.serve({
     port,
-    routes: {
-      "/": index,
-      "/mcp": mcpHandler,
-    },
     fetch(req): Response | Promise<Response> {
+      const path = new URL(req.url).pathname;
+      if (path === "/mcp") return mcpHandler(req);
+      const web = webAsset(path);
+      if (web) return web;
       return apiRouter(req);
     },
     development: { hmr: true, console: true },
@@ -108,9 +109,54 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   console.log(`  Paper library: http://localhost:${server.port}/api/papers  (org: ${s.POLARIS_PAPERS_ORG})\n`);
 }
 
+/**
+ * Bun's HTMLBundle asset manifest is tied to the process CWD after an npm
+ * installation. Serve the explicitly packaged files instead, so `polaris
+ * serve` works from any directory. Only root bundle assets are exposed.
+ */
+function webAsset(path: string): Response | null {
+  const bundled = join(import.meta.dir, "src", "server", "web", "index.html");
+  const html = existsSync(bundled) ? bundled : join(import.meta.dir, "web", "index.html");
+  if (path === "/") return new Response(Bun.file(html), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  const name = path.slice(1);
+  if (!/^index-[A-Za-z0-9_-]+\.(?:js|css)$/.test(name)) return null;
+  const asset = join(import.meta.dir, name);
+  if (!existsSync(asset)) return null;
+  return new Response(Bun.file(asset), {
+    headers: { "Content-Type": name.endsWith(".css") ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8" },
+  });
+}
+
 async function apiRouter(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
+
+  // The web UI never receives a key back. A supplied BYOK profile is held only
+  // in this process, which lets every web tab and the TUI use the same server
+  // configuration without putting secrets in browser storage.
+  if (path === "/api/config" && req.method === "GET") return json(byokStatus());
+  if (path === "/api/config" && req.method === "PUT") {
+    const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body) return json({ error: "expected a JSON configuration object" }, 400);
+    const apiKey = body["api_key"];
+    const baseUrl = body["base_url"];
+    const model = body["model"];
+    if (apiKey !== undefined && (typeof apiKey !== "string" || apiKey.length > 10_000)) {
+      return json({ error: "api_key must be a string up to 10,000 characters" }, 400);
+    }
+    if (baseUrl !== undefined && (typeof baseUrl !== "string" || baseUrl.length > 2_000 || !/^https?:\/\//i.test(baseUrl))) {
+      return json({ error: "base_url must be an http(s) URL" }, 400);
+    }
+    if (model !== undefined && (typeof model !== "string" || model.length > 500)) {
+      return json({ error: "model must be a string up to 500 characters" }, 400);
+    }
+    setRuntimeByok({
+      apiKey: apiKey as string | undefined,
+      baseUrl: baseUrl as string | undefined,
+      model: model as string | undefined,
+    });
+    return json(byokStatus());
+  }
 
   // POST /api/upload — extract text from an uploaded file (preview, no pipeline run)
   if (path === "/api/upload" && req.method === "POST") {
@@ -364,16 +410,16 @@ interface ParsedRun {
 }
 
 function invalidEngineError(value: string): { error: string; status: number } {
-  return { error: `invalid engine "${value}" — expected "local" or "trueforge"`, status: 400 };
+  return { error: `invalid engine "${value}" — expected "trueforge" (local aliased)`, status: 400 };
 }
 
 async function parseRunRequest(req: Request): Promise<ParsedRun> {
   const ct = req.headers.get("content-type") ?? "";
   const s = getSettings();
 
-  // Multipart: a file + optional text fields
+  // Multipart: a file + optional text fields — TrueForge forced
   if (ct.includes("multipart/form-data")) {
-    if (bodyTooLarge(req)) return { ...uploadTooLargeError(), arxivId: "", engine: "local", reuseIfExists: false, source: "upload" };
+    if (bodyTooLarge(req)) return { ...uploadTooLargeError(), arxivId: "", engine: "trueforge", reuseIfExists: false, source: "upload" };
     try {
       const form = await req.formData();
       const file = form.get("paper");
@@ -381,7 +427,7 @@ async function parseRunRequest(req: Request): Promise<ParsedRun> {
       let source = "json";
       if (file && file instanceof File) {
         if (file.size > s.MAX_UPLOAD_BYTES) {
-          return { ...uploadTooLargeError(), arxivId: "", engine: "local", reuseIfExists: false, source: "upload" };
+          return { ...uploadTooLargeError(), arxivId: "", engine: "trueforge", reuseIfExists: false, source: "upload" };
         }
         const bytes = await file.arrayBuffer();
         const result = await extractPaperText(file.name, bytes);
@@ -390,14 +436,14 @@ async function parseRunRequest(req: Request): Promise<ParsedRun> {
       }
       const arxivId = String(form.get("arxiv_id") ?? "");
       if (!arxivId && !markdown) {
-        return { error: "provide an arxiv_id or a 'paper' file", status: 400, arxivId: "", engine: "local", reuseIfExists: false, source };
+        return { error: "provide an arxiv_id or a 'paper' file", status: 400, arxivId: "", engine: "trueforge", reuseIfExists: false, source };
       }
-      const engineRaw = String(form.get("engine") ?? "local");
+      const engineRaw = String(form.get("engine") ?? "trueforge");
       let engine: EngineType;
       try {
         engine = parseEngine(engineRaw);
       } catch {
-        return { ...invalidEngineError(engineRaw), arxivId, markdown, engine: "local", reuseIfExists: false, source };
+        return { ...invalidEngineError(engineRaw), arxivId, markdown, engine: "trueforge", reuseIfExists: false, source };
       }
       const reuseRaw = form.get("reuse_if_exists");
       const reuse = reuseRaw == null ? false : parseStrictBool(reuseRaw);
@@ -415,23 +461,23 @@ async function parseRunRequest(req: Request): Promise<ParsedRun> {
         source,
       };
     } catch (e) {
-      return { error: `multipart parse failed: ${(e as Error).message}`, status: 400, arxivId: "", engine: "local", reuseIfExists: false, source: "error" };
+      return { error: `multipart parse failed: ${(e as Error).message}`, status: 400, arxivId: "", engine: "trueforge", reuseIfExists: false, source: "error" };
     }
   }
 
-  // JSON body
+  // JSON body — TrueForge forced
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
   const arxivId = String(body["arxiv_id"] ?? "");
   const markdown = body["markdown"] ? String(body["markdown"]) : undefined;
   if (!arxivId && !markdown) {
-    return { error: "provide an arxiv_id or markdown", status: 400, arxivId: "", engine: "local", reuseIfExists: false, source: "json" };
+    return { error: "provide an arxiv_id or markdown", status: 400, arxivId: "", engine: "trueforge", reuseIfExists: false, source: "json" };
   }
-  const engineRaw = String(body["engine"] ?? "local");
+  const engineRaw = String(body["engine"] ?? "trueforge");
   let engine: EngineType;
   try {
     engine = parseEngine(engineRaw);
   } catch {
-    return { ...invalidEngineError(engineRaw), arxivId, markdown, engine: "local", reuseIfExists: false, source: "json" };
+    return { ...invalidEngineError(engineRaw), arxivId, markdown, engine: "trueforge", reuseIfExists: false, source: "json" };
   }
   // Strict boolean parsing: `Boolean("false")` would be true — never coerce.
   const reuse = body["reuse_if_exists"] == null ? false : parseStrictBool(body["reuse_if_exists"]);

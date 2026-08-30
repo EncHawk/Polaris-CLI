@@ -209,11 +209,11 @@ test("findExistingImplementation locates a seeded repo by arxiv id", async () =>
 
 // ─── Qodo review fixes: regression tests ─────────────────────────────────────
 
-test("parseEngine accepts only local|trueforge (no silent fallback)", async () => {
+test("parseEngine forced TrueForge (local aliased, typo throws)", async () => {
   const { parseEngine } = await import("../src/agents_util/engine.ts");
-  expect(parseEngine(undefined)).toBe("local");
-  expect(parseEngine("")).toBe("local");
-  expect(parseEngine("local")).toBe("local");
+  expect(parseEngine(undefined)).toBe("trueforge");
+  expect(parseEngine("")).toBe("trueforge");
+  expect(parseEngine("local")).toBe("trueforge"); // aliased
   expect(parseEngine("trueforge")).toBe("trueforge");
   expect(parseEngine("TrueForge")).toBe("trueforge");
   expect(() => parseEngine("tureforge")).toThrow(/Invalid engine/);
@@ -282,6 +282,20 @@ test("Workspace refuses unowned non-empty dirs and confines file paths", async (
   expect(listing).not.toContain(".polaris-workspace");
 
   rmSync(tmp, { recursive: true, force: true });
+});
+
+test("workspace has no git publishing surface", async () => {
+  const { Workspace } = await import("../src/tools/workspace.ts");
+  const prototype = Workspace.prototype as unknown as Record<string, unknown>;
+  expect(typeof prototype.prepareGit).toBe("undefined");
+  expect(typeof prototype.publishGit).toBe("undefined");
+});
+
+test("trueForge specs prohibit dynamically delegated agents", async () => {
+  const { polarisAgentSpecs } = await import("../src/trueforge/agents.ts");
+  for (const spec of Object.values(polarisAgentSpecs())) {
+    expect(spec.config?.dynamicSubAgents?.enabled).toBe(false);
+  }
 });
 
 test("searchPolarisPapers returns no results when a direct id lookup misses", async () => {

@@ -1,12 +1,9 @@
 /**
- * Engine dispatcher — one entry point per agent turn that routes to either:
- *   - the local BYOK ReAct loop (`loop.ts`), or
- *   - the trueForge harness (`engine.ts`) when `engine === "trueforge"`.
- *
- * Both paths return a normalized `{ text, structured }` so the agents don't care
- * which engine ran. For the local engine we intercept the completion tool call
- * to capture the structured args (which agents previously captured via a
- * closure); for trueForge the structured output comes back from the SDK stream.
+ * Engine dispatcher — Polaris is **forced to use TrueForge**. The local BYOK
+ * ReAct loop (`loop.ts`) is retained only for reference/tests; all production
+ * runs are routed through the TrueForge harness (`trueforge/engine.ts`).
+ * `parseEngine` still accepts "local" as an alias for backward-compat but
+ * always resolves to "trueforge".
  */
 import type { TrueForge, TrueForgeApi } from "@truefoundry/trueforge-sdk";
 import type { AgentName } from "../state.ts";
@@ -15,18 +12,18 @@ import { runTrueForgeAgentTurn } from "../trueforge/engine.ts";
 import { makeTrueForgeClient } from "../trueforge/client.ts";
 import { COMPLETION_TOOL, type ChatMessage, type ToolArgs, type ToolDef, type ToolHandlers } from "../agents/types.ts";
 
-export type EngineType = "local" | "trueforge";
+export type EngineType = "trueforge";
 
 /**
- * Strictly parse an engine selector. Accepts "local"/"trueforge"
- * (case-insensitive); anything else — including typos — throws instead of
- * silently falling back to the local loop.
+ * Parse an engine selector. Polaris is TrueForge-only: any value (including
+ * empty / "local") resolves to "trueforge". Only truly unknown values throw
+ * so typos are still caught.
  */
 export function parseEngine(value: unknown): EngineType {
-  if (value == null || value === "") return "local";
+  if (value == null || value === "") return "trueforge";
   const v = String(value).trim().toLowerCase();
-  if (v === "local" || v === "trueforge") return v;
-  throw new Error(`Invalid engine "${String(value)}" — expected "local" or "trueforge"`);
+  if (v === "trueforge" || v === "local") return "trueforge";
+  throw new Error(`Invalid engine "${String(value)}" — expected "trueforge" (local is aliased to TrueForge)`);
 }
 
 export interface AgentTurnParams {
@@ -72,52 +69,23 @@ function toTfInput(history: ChatMessage[]): TrueForgeApi.TurnInputItem[] {
 }
 
 export async function runAgentTurn(p: AgentTurnParams): Promise<AgentTurnResult> {
-  const engine: EngineType = p.engine ?? "local";
+  // Forced TrueForge: all agent turns go through the harness. The local
+  // loop is retained only for unit-test reference and is never used in prod.
   const completionTool = COMPLETION_TOOL[p.agentName.toUpperCase()];
 
-  if (engine === "trueforge") {
-    const r = await runTrueForgeAgentTurn(tfClient(), {
-      agentName: p.agentName,
-      systemPrompt: p.systemPrompt,
-      userMessage: p.userMessage,
-      jobUuid: p.jobUuid,
-      agentEnum: p.agentEnum,
-      conversationHistory: toTfInput(p.conversationHistory ?? []),
-    });
-    return {
-      text: r.text,
-      structured: r.structured as ToolArgs | null,
-      sandboxFiles: r.sandboxFiles,
-      sandboxIncomplete: r.sandboxIncomplete,
-    };
-  }
-
-  // Local engine — wrap the completion tool handler to capture structured args.
-  let structured: ToolArgs | null = null;
-  const wrapped: ToolHandlers = {};
-  for (const [name, handler] of Object.entries(p.toolHandlers)) {
-    if (name === completionTool) {
-      wrapped[name] = async (args: ToolArgs) => {
-        structured = args;
-        return handler(args);
-      };
-    } else {
-      wrapped[name] = handler;
-    }
-  }
-
-  const text = await runAgenticCall({
+  // Always route through TrueForge harness (local is aliased)
+  const r = await runTrueForgeAgentTurn(tfClient(), {
     agentName: p.agentName,
     systemPrompt: p.systemPrompt,
     userMessage: p.userMessage,
-    tools: p.tools,
-    toolHandlers: wrapped,
     jobUuid: p.jobUuid,
     agentEnum: p.agentEnum,
-    model: p.model,
-    maxTokens: p.maxTokens,
-    conversationHistory: p.conversationHistory,
-    maxIterations: p.maxIterations,
+    conversationHistory: toTfInput(p.conversationHistory ?? []),
   });
-  return { text, structured };
+  return {
+    text: r.text,
+    structured: r.structured as ToolArgs | null,
+    sandboxFiles: r.sandboxFiles,
+    sandboxIncomplete: r.sandboxIncomplete,
+  };
 }

@@ -71,13 +71,17 @@ export class Settings {
   readonly DEV_MODE: boolean | null = env["DEV_MODE"] == null ? null : /^(1|true|yes|on)$/i.test(env["DEV_MODE"] ?? "");
 
   // ─── LLM (OpenAI-compatible, BYOK) ──────────────────────────────────────────
-  readonly POLARIS_API_KEY: string = str("POLARIS_API_KEY", env["DEEPINFRA_API_TOKEN"] ?? "");
-  readonly POLARIS_BASE_URL: string = str("POLARIS_BASE_URL", "https://api.deepinfra.com/v1/openai");
-  readonly POLARIS_DEFAULT_MODEL: string = str("POLARIS_DEFAULT_MODEL", "deepseek-ai/DeepSeek-V3.2-Flash");
+  readonly POLARIS_API_KEY: string = str(
+    "POLARIS_API_KEY",
+    env["OPENROUTER_API_KEY"] ?? env["GROQ_API_KEY"] ?? env["DEEPINFRA_API_TOKEN"] ?? "",
+  );
+  readonly POLARIS_BASE_URL: string = str("POLARIS_BASE_URL", "https://api.openai.com/v1");
+  readonly POLARIS_DEFAULT_MODEL: string = str("POLARIS_DEFAULT_MODEL", "gpt-4o-mini");
   readonly READ_MODEL: string = str("POLARIS_READ_MODEL", "");
   readonly RESEARCH_MODEL: string = str("POLARIS_RESEARCH_MODEL", "");
   readonly PLAN_MODEL: string = str("POLARIS_PLAN_MODEL", "");
   readonly CODE_MODEL: string = str("POLARIS_CODE_MODEL", "");
+  readonly VERIFY_MODEL: string = str("POLARIS_VERIFY_MODEL", str("VERIFY_MODEL", ""));
   readonly ORCHESTRATOR_MODEL: string = str("ORCHESTRATOR_MODEL", "");
 
   // ─── Loop / agent tuning ─────────────────────────────────────────────────────
@@ -111,23 +115,17 @@ export class Settings {
   readonly TRUEFORGE_SQLITE_PATH: string = str("POLARIS_TRUEFORGE_SQLITE_PATH", "");
   readonly TRUEFORGE_BASE_URL: string = str("POLARIS_TRUEFORGE_BASE_URL", "");
 
-  // ─── GitHub publishing ────────────────────────────────────────────────────────
+  // ─── GitHub read-only retrieval (never writes) ────────────────────────────────
   readonly GITHUB_ACCESS_TOKEN: string = str("GITHUB_ACCESS_TOKEN", str("GITHUB_ACCESS_KEY", ""));
-  readonly GITHUB_ORG: string = str("GITHUB_ORG", "Polaris-Implementations");
   readonly GITHUB_API_URL: string = str("GITHUB_API_URL", "https://api.github.com");
-  readonly GITHUB_REPO_PRIVATE: boolean = bool("GITHUB_REPO_PRIVATE", false);
 
   // ─── Polaris coded-implementation library (read-only retrieval) ────────────────
   // The GitHub org that holds our coded paper reproductions (paper-YYMM-NNNNN).
   // Used by the MCP paper-retrieval tools so coding agents can pull an existing
   // implementation for a paper/citation instead of writing from scratch.
+  // Polaris never creates, commits, or pushes repos — retrieval only.
   readonly POLARIS_PAPERS_ORG: string = str("POLARIS_PAPERS_ORG", "PolarisAI-Implementations");
   readonly POLARIS_PAPERS_TOKEN: string = str("POLARIS_PAPERS_TOKEN", str("GITHUB_ACCESS_TOKEN", ""));
-
-  // ─── Where newly generated implementations are pushed ───────────────────────────
-  // Defaults to the library org so generated reproductions join the library and
-  // become retrievable by future runs. Set to a separate org to keep them apart.
-  readonly POLARIS_PUBLISH_ORG: string = str("POLARIS_PUBLISH_ORG", str("POLARIS_PAPERS_ORG", "PolarisAI-Implementations"));
 
   /** Pick a per-agent model or fall back to the default. */
   modelFor(agent: string): string {
@@ -150,4 +148,18 @@ export function getSettings(): Settings {
     _settings = new Settings();
   }
   return _settings;
+}
+
+/** Apply a BYOK profile for this running process; secrets are never returned by the API. */
+export function setRuntimeByok(profile: { apiKey?: string; baseUrl?: string; model?: string }): void {
+  if (profile.apiKey !== undefined) env["POLARIS_API_KEY"] = profile.apiKey.trim();
+  if (profile.baseUrl !== undefined) env["POLARIS_BASE_URL"] = profile.baseUrl.trim().replace(/\/$/, "");
+  if (profile.model !== undefined) env["POLARIS_DEFAULT_MODEL"] = profile.model.trim();
+  _settings = null;
+}
+
+/** A safe-to-display BYOK status. The API key is intentionally never exposed. */
+export function byokStatus(): { configured: boolean; base_url: string; model: string } {
+  const s = getSettings();
+  return { configured: Boolean(s.POLARIS_API_KEY), base_url: s.POLARIS_BASE_URL, model: s.POLARIS_DEFAULT_MODEL };
 }

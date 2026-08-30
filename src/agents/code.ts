@@ -6,7 +6,6 @@ import { runAgentTurn, type EngineType } from "../agents_util/engine.ts";
 import { chatCompletion } from "../agents_util/llm.ts";
 import { getSettings } from "../config/settings.ts";
 import { Workspace, sanitizeRepoName } from "../tools/workspace.ts";
-import { GitHubRepository } from "../tools/github.ts";
 import { saveCodeCheckpoint, loadLatestCheckpoint, deleteCheckpoints } from "../agents_util/checkpoint.ts";
 import { defaultRepoName, extractTitle } from "../tools/upload.ts";
 
@@ -45,7 +44,7 @@ export const CODE_TRUEFORGE_ADDENDUM = `
 EXECUTION ENVIRONMENT (trueForge sandbox):
 You are running inside a trueForge sandbox, not the local polaris workspace. Do NOT call write_file, read_file, run_command, or list_files — they are not available here. Instead:
 1. Use the sandbox's built-in file and command tools to create each project file and run commands to verify they work.
-2. Every file you create in the sandbox is automatically downloaded into the user's project directory and published to GitHub by the polaris pipeline when you finish.
+2. Every file you create in the sandbox is automatically downloaded into the user's local project directory when you finish. Polaris does not publish to GitHub.
 3. When all files are implemented and working, call mark_implementation_complete with files_written listing every file you created (relative paths).`;
 
 export const CODE_TOOLS: ToolDef[] = [
@@ -139,7 +138,7 @@ async function generateReadme(arxivId: string, repoName: string, files: CodeFile
       messages: [
         {
           role: "system",
-          content: "You are a technical writer. Write a concise, good-looking README.md for a GitHub repo that reproduces a research paper.",
+            content: "You are a technical writer. Write a concise, useful README.md for a local project that reproduces a research paper.",
         },
         {
           role: "user",
@@ -175,8 +174,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     null, 2,
   ).slice(0, 4000);
 
-  // One canonical repo/workspace name, sanitized up front so the GitHub repo
-  // and the on-disk directory always agree. Papers without an arXiv id derive
+  // One canonical local workspace name, sanitized up front. Papers without an arXiv id derive
   // a stable title slug (or a unique job-derived name) instead of all sharing
   // one "paper-unknown" workspace.
   const repoName = sanitizeRepoName(
@@ -189,37 +187,9 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     ? (executionModeRaw as "create" | "modify" | "run")
     : "create";
   const existing = !!state.repo_exists || executionMode === "modify" || executionMode === "run";
-  const engine: EngineType = state.engine ?? "local";
+  const engine: EngineType = state.engine ?? "trueforge";
   const workspace = await Workspace.create(repoName, state.output_dir, existing ? "modify" : executionMode);
-  const hasGithub = !!s.GITHUB_ACCESS_TOKEN;
-  const repo = hasGithub ? new GitHubRepository() : null;
-  let githubUrl = state.github_url || (repo ? repo.htmlUrl(repoName) : "");
   const accumulatedLogs: RunLog[] = [];
-  let pushError = "";
-
-  if (existing && repo) {
-    try {
-      const remote = await repo.ensure(repoName);
-      githubUrl = remote.html_url || githubUrl;
-      const prepared = await workspace.prepareGit(remote.clone_url, remote.token, true);
-      step(jobUuid, "CODE", "repo-checkout", {
-        tool: "github+workspace",
-        conclusion: `checked out ${repoName} rc=${prepared.returncode}`,
-        output_query: githubUrl,
-      });
-      if (prepared.returncode !== 0) {
-        return {
-          code: { repo_name: repoName, github_url: githubUrl, push_error: prepared.stderr || prepared.stdout || "repo checkout failed" },
-          runs,
-        };
-      }
-    } catch (e) {
-      return {
-        code: { repo_name: repoName, github_url: githubUrl, push_error: `repo checkout failed: ${(e as Error).message}` },
-        runs,
-      };
-    }
-  }
 
   if (executionMode === "run") {
     const runResult = await workspace.exec("python reproduce.py");
@@ -228,17 +198,16 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
       conclusion: `rc=${runResult.returncode} ${runResult.stderr.slice(0, 160) || runResult.stdout.slice(0, 160)}`,
       output_query: "python reproduce.py",
     });
-    output(jobUuid, "CODE", `existing repo run rc=${runResult.returncode}`, githubUrl);
+    output(jobUuid, "CODE", `existing project run rc=${runResult.returncode}`, workspace.workdir);
     return {
       code: {
         files: [],
         run_logs: [{ step: "run-existing", stdout: runResult.stdout.slice(0, 3000), stderr: runResult.stderr.slice(0, 3000) }],
         notes: "Ran the existing repository without modifying it.",
         ready: runResult.returncode === 0,
-        output_query: githubUrl,
-        github_url: githubUrl,
+        output_query: workspace.workdir,
         repo_name: repoName,
-        push_error: runResult.returncode === 0 ? "" : runResult.stderr || "existing repo failed",
+        workspace_path: workspace.workdir,
       } as CodeOutput,
       runs,
     };
@@ -335,7 +304,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   data = result.structured;
 
   // trueForge engine: bridge the sandbox artifacts into the pipeline workspace
-  // so the files are persisted, checkpointed, and published exactly like
+  // so the files are persisted and checkpointed exactly like
   // locally-written files. Binary artifacts keep their raw bytes (no lossy
   // UTF-8 round-trip); only text files go into the JSON checkpoint.
   for (const f of result.sandboxFiles ?? []) {
@@ -357,9 +326,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     }
   }
 
-  if (codeFiles.length === 0) {
-    pushError = "code produced no output";
-  } else {
+  if (codeFiles.length > 0) {
     const paths = new Set(codeFiles.map((f) => f.path));
     if (!paths.has("README.md")) {
       const readme = await generateReadme(state.arxiv_id ?? "", repoName, codeFiles);
@@ -371,51 +338,22 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
         output_query: "README.md",
       });
     }
-    if (repo) {
-      try {
-        const remote = await repo.ensure(repoName, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
-        githubUrl = remote.html_url || githubUrl;
-        if (!existing) {
-          const prepared = await workspace.prepareGit(remote.clone_url, remote.token, false);
-          if (prepared.returncode !== 0) pushError = prepared.stderr || prepared.stdout || "repo initialization failed";
-        }
-        if (!pushError) {
-          const pushed = await workspace.publishGit(remote.token, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
-          step(jobUuid, "CODE", "repo-push", {
-            tool: "github+workspace",
-            conclusion: `pushed ${repoName} rc=${pushed.returncode}`,
-            output_query: githubUrl,
-          });
-          if (pushed.returncode !== 0) pushError = pushed.stderr || pushed.stdout || "repo push failed";
-        }
-      } catch (e) {
-        pushError = `repo publish failed: ${(e as Error).message}`;
-        step(jobUuid, "CODE", "repo-push-failed", {
-          tool: "github+workspace",
-          conclusion: pushError,
-          output_query: githubUrl,
-        });
-      }
-    }
   }
 
   deleteCheckpoints(jobUuid);
 
   // A partial sandbox bridge (artifacts over the cap, or skipped/failed
-  // downloads) must surface as a run failure — publishing a repo that's
+  // downloads) must surface as a run failure — leaving a local project that's
   // missing required source/assets as a success would be worse than failing.
-  if (result.sandboxIncomplete && !pushError) pushError = result.sandboxIncomplete;
-
   const d = (data ?? {}) as Record<string, unknown>;
   const code: CodeOutput = {
     files: codeFiles,
     run_logs: accumulatedLogs,
     notes: String(d["summary"] ?? d["caveats"] ?? ""),
-    ready: data != null && codeFiles.length > 0,
-    output_query: String(d["summary"] ?? "code produced output"),
-    github_url: githubUrl,
+    ready: data != null && codeFiles.length > 0 && !result.sandboxIncomplete,
+    output_query: String(d["summary"] ?? (result.sandboxIncomplete ?? "code produced output")),
     repo_name: repoName,
-    push_error: pushError,
+    workspace_path: workspace.workdir,
   };
   return { code, runs };
 }

@@ -6,17 +6,18 @@ import { runAgentTurn, type EngineType } from "../agents_util/engine.ts";
 import { Workspace, sanitizeRepoName } from "../tools/workspace.ts";
 import { defaultRepoName, extractTitle } from "../tools/upload.ts";
 
-export const VERIFY_SYSTEM_PROMPT = `You are the VERIFY agent for the Polaris paper-reproduction pipeline. Your job is to ensure the implementation actually persisted every signal from the initial paper intake and the plan.
+export const VERIFY_SYSTEM_PROMPT = `You are the VERIFY agent for the Polaris paper-reproduction pipeline. Your job is to ensure the implementation actually persisted every signal from the initial paper intake, the plan, and any post-plan suggestions.
 
-You have read-only access to the project workspace plus the READ and PLAN outputs.
+You have read-only access to the project workspace plus the READ, PLAN, and user feedback outputs.
 
 Rules:
 1. List the files in the workspace.
-2. Read every file the plan says should exist (plan[]. entries) — if a file is missing, note it.
-3. Cross-check deltas_from_base/intends_to_prove against file contents: each delta should be visible in at least one file.
-4. Cross-check the initial READ signals (aim, novel_approach, relevant_citations) — relevant_citations/numbers that the plan marked as additional queries should appear (comment, import, usage, or docs) in the code or README.
-5. Run a cheap syntactic check: \`python -m py_compile <file>\` for each .py file you found; skip non-Python.
-6. Summarize what passed and what is missing, then call complete_verify.
+2. Read every file the plan says should exist (plan[]. entries) — if a file is missing, note it in files_missing.
+3. Cross-check deltas_from_base/intends_to_prove/proof_method against file contents: each delta/suggestion should be visible in at least one file (code, comment, or README).
+4. Cross-check the initial READ signals (aim, novel_approach, relevant_citations, numbers, built_on) — every relevant_citation and number that the plan marked as an additional query should appear (comment, import, usage, or docs) in the code or README. Record covered ones in initial_queries_covered, missing in missing_signals.
+5. Cross-check post-plan suggestions: if the user gave plan_feedback or orchestrator_feedback after the plan, verify those suggestions were also persisted in the workspace (e.g., reviewer feedback incorporated).
+6. Run a cheap syntactic check: \`python -m py_compile <file>\` for each .py file you found; skip non-Python.
+7. Summarize what passed and what is missing, then call complete_verify with checks_passed=true only if every required signal is present.
 
 Available tools:
 - read_file: Read a file from the workspace (provide file_path)
@@ -198,14 +199,21 @@ export async function runVerify(state: WorkerState): Promise<Partial<WorkerState
     },
   };
 
+  const feedbackBlob = JSON.stringify({
+    plan_feedback: state.plan_feedback ?? "",
+    orchestrator_feedback: state.orchestrator_feedback ?? "",
+    code_feedback: (state as unknown as { code_feedback?: string }).code_feedback ?? "",
+  }, null, 2).slice(0, 2000);
+
   const userMessage =
     `PAPER: https://arxiv.org/abs/${state.arxiv_id ?? ""}\n\n` +
     `READ (initial signals + additional queries):\n${readBlob}\n\n` +
     `PLAN (deltas + intended proof + file list + additional-query usage):\n${planBlob}\n\n` +
+    `POST-PLAN SUGGESTIONS (feedback provided after plan was drafted, must also be persisted):\n${feedbackBlob}\n\n` +
     `WORKSPACE (${repoName}) — pre-list:\n${preList}\n\n` +
-    `Verify that every plan delta and every initial/additional-query signal is persisted in the workspace files.`;
+    `Verify that every plan delta, every initial/additional-query signal, AND every post-plan suggestion is persisted in the workspace files.`;
 
-  const engine: EngineType = state.engine ?? "local";
+  const engine: EngineType = state.engine ?? "trueforge";
   const result = await runAgentTurn({
     agentName: "VERIFY",
     systemPrompt: VERIFY_SYSTEM_PROMPT,

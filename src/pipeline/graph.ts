@@ -122,9 +122,9 @@ async function gatePlan(state: WorkerState): Promise<Node> {
 
 async function gateCode(state: WorkerState): Promise<Node> {
   const codeOut = state.code;
-  // CODE failures are terminal here — VERIFY is only for successful CODE
-  // outputs. A failed CODE (push_error/empty) goes straight to `failed`.
-  if (!codeOut || codeOut.push_error) return "failed";
+  // CODE failures are terminal here — VERIFY runs only after files have been
+  // produced locally and the implementation reported itself ready.
+  if (!codeOut || !codeOut.ready) return "failed";
   if (runsOf(state, "CODE") >= MAX_GATE_RETRIES || isStuckRepeat(state, "CODE", codeOut)) {
     delete state.orchestrator_feedback;
     if (!state.code) return "failed";

@@ -75,9 +75,8 @@ export interface CodeOutput {
   notes?: string;
   ready?: boolean;
   output_query?: string;
-  github_url?: string;
   repo_name?: string;
-  push_error?: string;
+  workspace_path?: string;
 }
 
 export interface VerifyOutput {
@@ -123,7 +122,7 @@ export interface WorkerState {
   orchestrator_feedback?: string;
   /** Skip the human plan-approval gate (used by the MCP server / non-interactive runs). */
   auto_approve?: boolean;
-  /** Execution engine: "local" (BYOK ReAct loop) or "trueforge" (harness). */
+  /** Execution engine: forced "trueforge" (local alias). */
   engine?: import("./agents_util/engine.ts").EngineType;
   /** Directory to create the project in (defaults to POLARIS_OUTPUT_DIR or cwd). */
   output_dir?: string;
