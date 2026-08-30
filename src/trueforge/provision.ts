@@ -2,8 +2,8 @@
  * Provision a trueForge server with everything polaris needs — idempotent so it
  * is safe to run on every `polaris setup` / `polaris serve`:
  *   1. a custom (BYOK) model provider pointing at the user's OpenAI-compatible endpoint
- *   2. the polaris MCP server (completion + arxiv + github tools)
- *   3. the four polaris agents (read / research / plan / code)
+ *   2. the polaris MCP server (completion + arxiv + library tools)
+ *   3. the five polaris agents (read / research / plan / code / verify)
  */
 import type { TrueForge } from "@truefoundry/trueforge-sdk";
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
@@ -57,14 +57,14 @@ export async function provisionTrueForge(client: TrueForge, opts: ProvisionOptio
       type: "remote",
       name: POLARIS_MCP_NAME,
       url: opts.mcpUrl,
-      description: "Polaris agent tools: completion signals, arxiv lookup, paper-implementation library search/retrieval, GitHub publishing.",
+      description: "Polaris agent tools: completion signals, arxiv lookup, and read-only paper-implementation library search/retrieval.",
       auth,
     },
   });
 
   // 3 ── polaris agents (create if missing, update if present) ──────────────────
   const specs = polarisAgentSpecs();
-  const keys = ["read", "research", "plan", "code"] as const;
+  const keys = ["read", "research", "plan", "code", "verify"] as const;
   const { data: existing } = await client.agents.list();
   const byName = new Map(existing.map((a) => [a.name, a]));
 

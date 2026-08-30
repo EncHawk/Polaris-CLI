@@ -34,4 +34,5 @@ export const COMPLETION_TOOL: Record<string, string> = {
   RESEARCH: "complete_research",
   PLAN: "complete_plan",
   CODE: "mark_implementation_complete",
+  VERIFY: "complete_verify",
 };

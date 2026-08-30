@@ -13,15 +13,13 @@ Typescript alone, we port all the agents we need from ../polaris/
 2: building a better interface and the MCP tool becoming a way to retrieve the right paper based on what the agent is asking for, all our papers are at https://github.com/PolarisAI-Implementations for retrieval. just note that by default all our agents need to run on Trueforge, while the MCP lets the coding agents to run the coded-implementations from our github. 
 Anything from our backend needs to use trueforge as the harness. 
 
-3: Deployment => I need a good TUI chat interface for just the normal invocation, and also the invocation needs to be happening from the NPM global installation so get ready to build the final CLI and lmk of the kind of credentials you need. 
+3: Deployment => A rich full-screen TUI chat interface (`polaris start` or default `polaris` invocation) boots trueForge + local MCP APIs straight away, presents an interactive provider selection menu (`Ctrl+S` / `:settings`), and allows users to change providers at any point or enter paper IDs / files directly. Works seamlessly from global NPM installation (`polaris-cli-enchawk`).
 
-4: Testing and Chaos Testing => This is vital af, get ready for going treating all teh code as a blackbox and using the package installed from NPM. Be clear about the kind of packages we install as sub-modules, its got to be safe to use
-
+4: Testing and Chaos Testing => Treat all code as a blackbox, verify NPM global installation, and ensure safe dependencies.
 
 ## Deployment (post building)
 
-
-right we're gonna write a CLI tool that mimics what the polaris agents do. Also we need to use trueForge by all means.
+The CLI tool (`polaris` / `polarisai`) runs all agents via TrueForge harness, auto-booting necessary services straight away.
 
 
 

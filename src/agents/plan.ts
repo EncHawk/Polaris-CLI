@@ -2,7 +2,7 @@ import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
 import type { WorkerState, PlanOutput, CustomKernels } from "../state.ts";
 import { markAgentRun } from "../state.ts";
 import { status, step } from "../pipeline/trace.ts";
-import { runAgentTurn } from "../agents_util/engine.ts";
+import { runAgentTurn, type EngineType } from "../agents_util/engine.ts";
 import { getSettings } from "../config/settings.ts";
 import { approvalGate } from "../pipeline/approval.ts";
 
@@ -99,7 +99,7 @@ export async function runPlan(state: WorkerState): Promise<Partial<WorkerState>>
     agentEnum: "PLAN",
     maxTokens: s.AGENT_MAX_STEPS * 4096,
     conversationHistory,
-    engine: (state.engine as "local" | "trueforge") ?? "local",
+    engine: (state.engine as EngineType) ?? "trueforge",
   });
   data = turn.structured;
 

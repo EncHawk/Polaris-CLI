@@ -2,7 +2,7 @@ import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
 import type { WorkerState, ReadOutput } from "../state.ts";
 import { markAgentRun } from "../state.ts";
 import { status } from "../pipeline/trace.ts";
-import { runAgentTurn } from "../agents_util/engine.ts";
+import { runAgentTurn, type EngineType } from "../agents_util/engine.ts";
 import { getSettings } from "../config/settings.ts";
 
 export const READ_SYSTEM_PROMPT = `You are the READ agent for an automated research-paper reproduction pipeline.
@@ -113,7 +113,7 @@ export async function runRead(state: WorkerState): Promise<Partial<WorkerState>>
     agentEnum: "READ",
     maxTokens: s.AGENT_MAX_STEPS * 4096,
     conversationHistory,
-    engine: (state.engine as "local" | "trueforge") ?? "local",
+    engine: (state.engine as EngineType) ?? "trueforge",
   });
   data = result.structured;
 

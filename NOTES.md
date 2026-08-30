@@ -34,14 +34,22 @@ Ported the full polaris paper-reproduction pipeline (Python/LangGraph → TypeSc
 - **doctor**: now reports paper-library org + auth status.
 - **npm-package ready**: `package.json` is publishable (`private` removed, `files` whitelist = `index.ts`/`src`/`README.md`/`.env.example`, `engines.bun >=1.1.0`, dropped the spurious `typescript` peerDep). trueForge CLI is resolved via `createRequire(import.meta.url).resolve(...)` instead of `<pkg>/node_modules/.bin/trueforge`, so it survives npm hoisting + global installs; trueForge now runs with `cwd=~/.polaris` (not the package install dir). All outputs (project dirs, checkpoints, trueForge sqlite/logs) resolve to the user's cwd / `~/.polaris` — nothing assumes the package's install location.
 
+#### Phase 3 — chat TUI + global-install invocation + Verify agent
+
+- **Chat TUI & Provider Selection**: `src/server/tui.ts` rewritten as a full-screen interactive chat interface for `polaris start` and default `polaris` invocation — alternate-screen buffer with header (paper/engine/phase), scrolling transcript (agent messages, tool steps), plan rendered as a bordered card when it needs approval, and an always-available input line. Automatically boots trueForge + local MCP APIs straight away on startup. Features interactive provider selection menu (`openSettings()`) with quick presets (`1` OpenAI, `2` Anthropic, `3` DeepInfra, `4` Together AI, `5` Ollama/vLLM) and clear notice: `"💡 Note: You can change your LLM provider at any point using Ctrl+S or :settings"`. Also supports interactive paper prompt mode (typing arXiv ID or PDF path directly into chat input).
+- **Global-install config**: `src/config/settings.ts` also loads `~/.polaris/.env` (cwd `.env` + real env always win) so `npm i -g polaris-cli` works from any directory. `POLARIS_MCP_PUBLIC_URL` + port settings in `.env.example`; `polaris doctor` reports both `~/.polaris/.env` and `./.env`.
+- **Verify agent**: `src/agents/verify.ts` — runs last (`CODE → VERIFY → END`) to ensure the implementation persisted every signal from the initial READ and the plan's additional queries. It lists the workspace, reads each planned file, cross-checks deltas/intended proof + relevant_citations/numbers against file contents, runs `python -m py_compile` on each `.py`, and calls `complete_verify` with `plan_signals_covered`, `missing_signals`, `initial_queries_covered`, `files_verified/missing`, `checks_passed`. A `checks_passed: false` fails the run (visible in the graph, the TUI, and the `VERIFY` trace). The agent is registered on the MCP server and as `polaris-verify` in trueForge (5 agents total); the pipeline exposes `verify` in `WorkerState` and on the status stream. The TUI renders the verify result and the follow-up `:modify` path seeds `orchestrator_feedback` so the user can steer a fix from the chat.
+- **Follow-up jobs**: `src/pipeline/run.ts` accepts `plan_feedback` (→ `state.plan_feedback` for PLAN replans) and `code_feedback` (→ `state.orchestrator_feedback` for CODE). The TUI chat loop uses them for `:rerun`/`:modify`.
+
 ### Verified
 
 - `bunx tsc --noEmit` — clean
-- `bun test` — 26/26 pass (incl. regression tests for all Qodo findings, round 1 + 2)
-- `polaris doctor` — config check works
-- `polaris mcp` — MCP initialize + tools/list handshake works over stdio
-- `polaris serve` — web page served (Bun bundler transpiles React), API endpoints work
-- `polaris serve --tf` — trueForge boots, provisions model provider + MCP + all 4 agents (verified via API)
+- `bun test` — 30/30 pass (incl. verify agent + wrapText/parseEnvFile + all Qodo regressions)
+- `polaris doctor` — config check works (`~/.polaris/.env` reported)
+- `polaris mcp` — MCP initialize + tools/list handshake works over stdio (now 9 tools incl. `complete_verify`)
+- `polaris serve` — web page served (Bun bundler transpiles React), API endpoints work (including from globally-installed `polaris`)
+- `polaris serve --tf` — trueForge boots, provisions model provider + MCP + all 5 agents (verified via API)
+- `npm pack` + `npm i -g ./polaris-cli-0.1.0.tgz` — global install verified: `polaris --help`, `doctor` (with `~/.polaris/.env`), `mcp` handshake, and `serve` all work from the globally-installed binary
 
 ### Not yet wired
 

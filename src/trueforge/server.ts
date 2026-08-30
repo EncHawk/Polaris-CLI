@@ -38,14 +38,27 @@ function logPath(): string {
 export async function startTrueForgeServer(overrides: { port?: number; sqlitePath?: string } = {}): Promise<TrueForgeServer> {
   const s = getSettings();
   const port = overrides.port ?? s.TRUEFORGE_PORT;
-  const sqlite = overrides.sqlitePath ?? s.TRUEFORGE_SQLITE_PATH ?? join(LOG_DIR, "trueforge.sqlite");
+  // Only override SQLITE_PATH if the user explicitly configured it — otherwise
+  // let trueforge use its default (~/Library/Application Support/... on macOS)
+  // which is known to work with Bun's sqlite. Forcing ~/.polaris/trueforge.sqlite
+  // crashes Bun's NAPI sqlite binding (see trueforge.log Bun panic).
+  const sqlite = overrides.sqlitePath ?? s.TRUEFORGE_SQLITE_PATH ?? "";
   mkdirSync(LOG_DIR, { recursive: true });
+
+  // Ensure default SQLite directory exists if custom path is not provided
+  if (!sqlite) {
+    const defaultDbDir = join(homedir(), "Library", "Application Support", "trueforge", "db");
+    mkdirSync(defaultDbDir, { recursive: true });
+  } else {
+    const { dirname } = await import("node:path");
+    mkdirSync(dirname(sqlite), { recursive: true });
+  }
 
   const env: Record<string, string | undefined> = {
     ...Bun.env,
     PORT: String(port),
-    SQLITE_PATH: sqlite,
     PUBLIC_BASE_URL: `http://localhost:${port}`,
+    ...(sqlite ? { SQLITE_PATH: sqlite } : {}),
   };
 
   if (!TRUEFORGE_CLI) {
@@ -53,10 +66,15 @@ export async function startTrueForgeServer(overrides: { port?: number; sqlitePat
       "trueForge CLI not found — @truefoundry/trueforge is not installed. Run `bun add @truefoundry/trueforge`.",
     );
   }
-  // Run trueForge from the polaris data dir (not the package install dir) so a
-  // global/npm install doesn't write runtime files into node_modules.
-  const proc = Bun.spawn([TRUEFORGE_CLI], {
-    cwd: LOG_DIR,
+  // Run trueForge with Node (not Bun) — the bundled better-sqlite3 native
+  // binding crashes under Bun's NAPI shim (Bun 1.3.3 panic). Node is stable.
+  // Use the package root as cwd so Node can resolve `env-paths` etc. from
+  // the project's node_modules; data/log paths are absolute so they still
+  // land in ~/.polaris.
+  const nodeBin = Bun.which("node") ?? process.execPath;
+  const pkgRoot = join(import.meta.dir, "../..");
+  const proc = Bun.spawn([nodeBin, TRUEFORGE_CLI], {
+    cwd: pkgRoot,
     env,
     stdout: Bun.file(logPath()),
     stderr: Bun.file(logPath()),

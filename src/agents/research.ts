@@ -2,7 +2,7 @@ import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
 import type { WorkerState, ResearchOutput, ResearchCitation, RelevantCitation } from "../state.ts";
 import { markAgentRun } from "../state.ts";
 import { status } from "../pipeline/trace.ts";
-import { runAgentTurn } from "../agents_util/engine.ts";
+import { runAgentTurn, type EngineType } from "../agents_util/engine.ts";
 import { getSettings } from "../config/settings.ts";
 import { searchId, searchTitle } from "../tools/arxiv.ts";
 import { searchPolarisPapers } from "../tools/papers.ts";
@@ -160,7 +160,7 @@ export async function runResearch(state: WorkerState): Promise<Partial<WorkerSta
     agentEnum: "RESEARCH",
     maxTokens: s.AGENT_MAX_STEPS * 4096,
     conversationHistory,
-    engine: (state.engine as "local" | "trueforge") ?? "local",
+    engine: (state.engine as EngineType) ?? "trueforge",
   });
   data = result.structured;
 

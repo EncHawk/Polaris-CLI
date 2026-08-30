@@ -1,22 +1,25 @@
 {
-  "name": "polaris-cli",
-  "version": "0.1.0",
+  "name": "polarisai",
+  "version": "0.1.5",
   "description": "Polaris AI CLI — a BYOK agent harness that reproduces research papers, powered by trueForge. An MCP to access our agents for harness!",
-  "module": "index.ts",
+  "module": "dist/index.js",
+  "main": "dist/index.js",
   "type": "module",
   "bin": {
-    "polaris": "./index.ts"
+    "polaris": "dist/index.js"
   },
   "files": [
-    "index.ts",
-    "src",
+    "dist",
     "README.md",
+    "EXPLAIN.md",
     ".env.example"
   ],
   "engines": {
     "bun": ">=1.1.0"
   },
   "scripts": {
+    "build": "rm -rf ./dist && bun build ./index.ts ./src/server/web/index.html --outdir ./dist --target=bun --minify --sourcemap=external --asset-naming='[dir]/[name]-[hash].[ext]'",
+    "prepublishOnly": "bun run build",
     "dev": "bun --hot ./index.ts",
     "start": "bun ./index.ts",
     "serve": "bun ./index.ts serve",

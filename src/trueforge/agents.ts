@@ -1,7 +1,7 @@
 /**
  * Polaris agents expressed as trueForge AgentSpecs — the manifests `polaris setup`
  * saves into the trueForge registry. Each agent reuses the ported polaris system
- * prompt and attaches the polaris MCP server (completion + arxiv + github tools).
+ * prompt and attaches the polaris MCP server (completion + arxiv + library tools).
  * The CODE agent additionally gets trueForge's sandbox-as-tool.
  */
 import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
@@ -10,6 +10,7 @@ import { READ_SYSTEM_PROMPT } from "../agents/read.ts";
 import { RESEARCH_SYSTEM_PROMPT } from "../agents/research.ts";
 import { PLAN_SYSTEM_PROMPT } from "../agents/plan.ts";
 import { CODE_SYSTEM_PROMPT } from "../agents/code.ts";
+import { VERIFY_SYSTEM_PROMPT } from "../agents/verify.ts";
 
 export const POLARIS_MCP_NAME = "polaris";
 export const POLARIS_PROVIDER_NAME = "polaris-byok";
@@ -37,7 +38,7 @@ function baseSpec(instructions: string): Spec {
   };
 }
 
-export function polarisAgentSpecs(): Record<"read" | "research" | "plan" | "code", Spec> {
+export function polarisAgentSpecs(): Record<"read" | "research" | "plan" | "code" | "verify", Spec> {
   const code = baseSpec(CODE_SYSTEM_PROMPT);
   return {
     read: baseSpec(READ_SYSTEM_PROMPT),
@@ -47,7 +48,8 @@ export function polarisAgentSpecs(): Record<"read" | "research" | "plan" | "code
       ...code,
       config: { ...code.config!, sandbox: { enabled: true } },
     },
+    verify: baseSpec(VERIFY_SYSTEM_PROMPT),
   };
 }
 
-export const POLARIS_AGENT_NAMES = ["polaris-read", "polaris-research", "polaris-plan", "polaris-code"] as const;
+export const POLARIS_AGENT_NAMES = ["polaris-read", "polaris-research", "polaris-plan", "polaris-code", "polaris-verify"] as const;
