@@ -17,7 +17,7 @@ bun ./index.ts serve --tf              # start agent-server + trueForge (web UI 
 ## Global installation (npm)
 
 ```bash
-npm i -g polaris-cli       # requires bun on your PATH (the CLI runs on Bun)
+npm i -g polaris-cli-enchawk # requires bun on your PATH (the CLI runs on Bun)
 polaris doctor
 polaris run 2403.09876
 ```
