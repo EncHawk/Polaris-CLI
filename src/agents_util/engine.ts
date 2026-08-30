@@ -17,6 +17,18 @@ import { COMPLETION_TOOL, type ChatMessage, type ToolArgs, type ToolDef, type To
 
 export type EngineType = "local" | "trueforge";
 
+/**
+ * Strictly parse an engine selector. Accepts "local"/"trueforge"
+ * (case-insensitive); anything else — including typos — throws instead of
+ * silently falling back to the local loop.
+ */
+export function parseEngine(value: unknown): EngineType {
+  if (value == null || value === "") return "local";
+  const v = String(value).trim().toLowerCase();
+  if (v === "local" || v === "trueforge") return v;
+  throw new Error(`Invalid engine "${String(value)}" — expected "local" or "trueforge"`);
+}
+
 export interface AgentTurnParams {
   agentName: string;
   systemPrompt: string;
@@ -35,6 +47,11 @@ export interface AgentTurnParams {
 export interface AgentTurnResult {
   text: string;
   structured: ToolArgs | null;
+  /**
+   * Files the engine produced out-of-band (trueForge sandbox artifacts for the
+   * CODE agent). The caller bridges them into the pipeline workspace.
+   */
+  sandboxFiles?: Array<{ path: string; contents: string }>;
 }
 
 let _tfClient: TrueForge | null = null;
@@ -64,7 +81,11 @@ export async function runAgentTurn(p: AgentTurnParams): Promise<AgentTurnResult>
       agentEnum: p.agentEnum,
       conversationHistory: toTfInput(p.conversationHistory ?? []),
     });
-    return { text: r.text, structured: r.structured as ToolArgs | null };
+    return {
+      text: r.text,
+      structured: r.structured as ToolArgs | null,
+      sandboxFiles: r.sandboxFiles,
+    };
   }
 
   // Local engine — wrap the completion tool handler to capture structured args.

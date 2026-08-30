@@ -40,6 +40,16 @@ export class Settings {
   readonly AGENT_MAX_STEPS: number = int("POLARIS_AGENT_MAX_STEPS", int("AGENT_MAX_STEPS", 4));
   readonly ARXIV_MAX_CITATIONS: number = int("POLARIS_ARXIV_MAX_CITATIONS", int("ARXIV_MAX_CITATIONS", 8));
 
+  // ─── Upload limits (guards against oversized payloads / LLM inputs) ─────────
+  readonly MAX_UPLOAD_BYTES: number = int("POLARIS_MAX_UPLOAD_MB", 25) * 1024 * 1024;
+  readonly MAX_PAPER_CHARS: number = int("POLARIS_MAX_PAPER_CHARS", 600_000);
+
+  // ─── Ports ───────────────────────────────────────────────────────────────────
+  /** Agent-server (web UI + REST + MCP route) listen port. */
+  readonly POLARIS_PORT: number = int("POLARIS_PORT", 8788);
+  /** Standalone MCP endpoint port used by `polaris run --engine trueforge`. */
+  readonly POLARIS_MCP_PORT: number = int("POLARIS_MCP_PORT", 8791);
+
   // ─── CODE agent output (writes directly to the client's filesystem) ───────────
   // Where project directories are created. Defaults to the current working
   // directory, so `polaris run 2106.09685` creates `./paper-2106-09685/`.

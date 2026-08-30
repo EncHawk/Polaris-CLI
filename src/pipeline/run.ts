@@ -19,7 +19,8 @@
 import type { WorkerState } from "../state.ts";
 import { runGraph } from "./graph.ts";
 import { error, status, step, output } from "./trace.ts";
-import { findExistingImplementation, extractArxivId, extractTitle } from "../tools/upload.ts";
+import { findExistingImplementation, extractArxivId, extractTitle, defaultRepoName } from "../tools/upload.ts";
+import { parseEngine } from "../agents_util/engine.ts";
 
 export interface Job {
   job_uuid?: string;
@@ -61,7 +62,18 @@ export async function fetchArxivMarkdown(arxivId: string): Promise<string> {
 export async function runOne(job: Job): Promise<WorkerState> {
   const jobUuid = job.job_uuid ?? crypto.randomUUID();
   const paperId = job.paper_id ?? "";
-  const engine = job.engine ?? "local";
+
+  // Reject unknown engines up front with a clear error instead of silently
+  // running the local loop for a typo'd `--engine tureforge`.
+  let engine: WorkerState["engine"];
+  try {
+    engine = parseEngine(job.engine);
+  } catch (e) {
+    const msg = (e as Error).message;
+    error(jobUuid, "SYSTEM", msg);
+    status(jobUuid, "failed");
+    return { job_uuid: jobUuid, paper_id: paperId, status: "failed", error: msg };
+  }
 
   status(jobUuid, "running");
   step(jobUuid, "SYSTEM", "job-start", {
@@ -134,7 +146,9 @@ export async function runOne(job: Job): Promise<WorkerState> {
     user_id: job.user_id ?? "",
     arxiv_id: arxivId,
     top_n_citations: job.top_n_citations ?? 8,
-    repo_name: job.repo_name ?? "",
+    // Default name: paper-YYMM-NNNNN for arXiv papers, title slug (or unique
+    // job-derived name) for id-less uploads — never a shared "paper-unknown".
+    repo_name: job.repo_name || defaultRepoName(arxivId, title, jobUuid),
     github_url: job.github_url ?? "",
     repo_exists: job.repo_exists ?? false,
     execution_mode: job.execution_mode ?? "create",

@@ -17,6 +17,7 @@
 import { extractText } from "unpdf";
 import { searchPolarisPapers, arxivIdToRepoName, type PaperRepo } from "./papers.ts";
 import { normalizeId } from "./arxiv.ts";
+import { getSettings } from "../config/settings.ts";
 
 export type PaperKind = "pdf" | "markdown" | "text" | "latex" | "unknown";
 
@@ -94,7 +95,7 @@ export async function extractPaperText(filename: string, bytes: ArrayBuffer | Ui
   return {
     kind,
     filename,
-    markdown: md,
+    markdown: md.slice(0, getSettings().MAX_PAPER_CHARS),
     pages,
     chars: md.length,
     arxiv_id: extractArxivId(md),
@@ -118,10 +119,45 @@ export interface LibraryCheckResult {
   reason: string;
 }
 
+const TITLE_STOPWORDS = new Set([
+  "the", "a", "an", "of", "and", "or", "for", "in", "on", "to", "with", "from",
+  "by", "is", "are", "as", "at", "its", "this", "that", "via", "using", "toward", "towards",
+]);
+
+/** Content-bearing tokens of a title (lowercased, punctuation stripped, stopwords removed). */
+function titleTokens(title: string): string[] {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !TITLE_STOPWORDS.has(w));
+}
+
+/**
+ * How strongly a library repo matches a paper title: the fraction of the
+ * title's content tokens present in the repo name + description. 1 = every
+ * token present. Used to decide whether a keyword-search hit is really the
+ * same paper (vs. an unrelated repo that merely mentions some words).
+ */
+export function titleMatchConfidence(title: string, repo: PaperRepo): number {
+  const tokens = titleTokens(title);
+  if (tokens.length === 0) return 0;
+  const hay = `${repo.repo_name} ${repo.description}`.toLowerCase();
+  let hits = 0;
+  for (const w of tokens) if (hay.includes(w)) hits++;
+  return hits / tokens.length;
+}
+
+/** Minimum title-token overlap before a keyword-search hit counts as "found". */
+export const TITLE_MATCH_THRESHOLD = 0.8;
+
 /**
  * Check the Polaris coded-implementation library for an existing reproduction.
- * Tries a direct arxiv-id lookup first, then falls back to a title/keyword
- * search. Returns the match (if any) plus runner-up candidates.
+ * Tries a direct arxiv-id lookup first (exact), then a title/keyword search.
+ * A keyword hit only counts as `found` when the repo's metadata strongly
+ * matches the paper title (verified identity) — fuzzy hits come back as
+ * candidates only, so `reuse_if_exists` can never short-circuit to an
+ * unrelated implementation.
  */
 export async function findExistingImplementation(
   arxivId: string,
@@ -143,7 +179,22 @@ export async function findExistingImplementation(
   try {
     const matches = await searchPolarisPapers({ query: q, limit: 5 });
     if (matches.length > 0) {
-      return { found: true, repo: matches[0]!, candidates: matches, reason: `matched title query "${q}"` };
+      const best = matches[0]!;
+      const confidence = titleMatchConfidence(q, best);
+      if (confidence >= TITLE_MATCH_THRESHOLD) {
+        return {
+          found: true,
+          repo: best,
+          candidates: matches,
+          reason: `title matched ${best.repo_name} (${Math.round(confidence * 100)}% token overlap)`,
+        };
+      }
+      return {
+        found: false,
+        repo: null,
+        candidates: matches,
+        reason: `title search returned candidates but none verified (best: ${best.repo_name}, ${Math.round(confidence * 100)}% token overlap < ${Math.round(TITLE_MATCH_THRESHOLD * 100)}%)`,
+      };
     }
   } catch {
     /* ignore */
@@ -155,4 +206,28 @@ export async function findExistingImplementation(
 export function implementationRepoName(arxivId: string, fallback: string): string {
   const aid = normalizeId(arxivId);
   return aid ? arxivIdToRepoName(aid) : fallback;
+}
+
+/** Slugify a paper title into a GitHub-safe repo-name fragment. */
+export function slugifyTitle(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60)
+    .replace(/-+$/g, "");
+  return slug.length >= 4 ? slug : "";
+}
+
+/**
+ * Default repo/workspace name for a run. Papers with an arXiv id follow the
+ * `paper-YYMM-NNNNN` library convention; uploaded papers without one derive a
+ * stable sanitized name from the title; papers with neither get a unique
+ * job-derived suffix so id-less runs never share one workspace.
+ */
+export function defaultRepoName(arxivId: string, title: string, jobUuid: string): string {
+  const aid = normalizeId(arxivId);
+  if (aid) return arxivIdToRepoName(aid);
+  const slug = slugifyTitle(title);
+  return slug ? `paper-${slug}` : `paper-${jobUuid.replace(/-/g, "").slice(0, 8)}`;
 }

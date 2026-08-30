@@ -10,6 +10,10 @@ import {
   extractPaperText,
   findExistingImplementation,
   implementationRepoName,
+  defaultRepoName,
+  slugifyTitle,
+  titleMatchConfidence,
+  TITLE_MATCH_THRESHOLD,
 } from "../src/tools/upload.ts";
 
 test("trace bus emits and replays history", () => {
@@ -184,4 +188,152 @@ test("findExistingImplementation locates a seeded repo by arxiv id", async () =>
   } catch (e) {
     console.warn("findExistingImplementation skipped (network/rate-limit):", (e as Error).message);
   }
+});
+
+// ─── Qodo review fixes: regression tests ─────────────────────────────────────
+
+test("parseEngine accepts only local|trueforge (no silent fallback)", async () => {
+  const { parseEngine } = await import("../src/agents_util/engine.ts");
+  expect(parseEngine(undefined)).toBe("local");
+  expect(parseEngine("")).toBe("local");
+  expect(parseEngine("local")).toBe("local");
+  expect(parseEngine("trueforge")).toBe("trueforge");
+  expect(parseEngine("TrueForge")).toBe("trueforge");
+  expect(() => parseEngine("tureforge")).toThrow(/Invalid engine/);
+  expect(() => parseEngine("remote")).toThrow(/Invalid engine/);
+});
+
+test("parseArgs never mistakes option values for the positional arxiv id", async () => {
+  const { parseArgs } = await import("../src/cli/index.ts");
+  // The regression: `polaris run --file paper.pdf` used to set the id to "paper.pdf".
+  const fileOnly = parseArgs(["--file", "paper.pdf"]);
+  expect(fileOnly.positionals).toEqual([]);
+  expect(fileOnly.values.get("--file")).toBe("paper.pdf");
+
+  const withId = parseArgs(["2106.09685", "--auto", "--engine", "trueforge"]);
+  expect(withId.positionals).toEqual(["2106.09685"]);
+  expect(withId.values.get("--engine")).toBe("trueforge");
+  expect(withId.flags.has("--auto")).toBe(true);
+
+  const everything = parseArgs(["--engine", "local", "--file", "p.pdf", "1706.03762", "--reuse"]);
+  expect(everything.positionals).toEqual(["1706.03762"]);
+
+  expect(() => parseArgs(["--file"])).toThrow(/Missing value/);
+});
+
+test("sanitizeRepoName reduces repo names to a safe single component", async () => {
+  const { sanitizeRepoName } = await import("../src/tools/workspace.ts");
+  expect(sanitizeRepoName("paper-2106-09685")).toBe("paper-2106-09685");
+  expect(sanitizeRepoName("../../project")).toBe("project");
+  expect(sanitizeRepoName("/home/user/project")).toBe("project");
+  expect(sanitizeRepoName("my repo!")).toBe("my-repo");
+  expect(() => sanitizeRepoName("...___")).toThrow(/Invalid repository name/);
+  expect(() => sanitizeRepoName("///")).toThrow(/Invalid repository name/);
+  expect(() => sanitizeRepoName("")).toThrow(/Invalid repository name/);
+});
+
+test("Workspace refuses unowned non-empty dirs and confines file paths", async () => {
+  const { Workspace } = await import("../src/tools/workspace.ts");
+  const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const tmp = `/tmp/polaris-ws-${crypto.randomUUID()}`;
+
+  // create mode refuses a pre-existing non-empty directory polaris doesn't own
+  const foreign = join(tmp, "foreign");
+  mkdirSync(foreign, { recursive: true });
+  writeFileSync(join(foreign, "secret.txt"), "do not commit me");
+  expect(() => Workspace.create("foreign", tmp)).toThrow(/already exists and is not empty/);
+
+  // a workspace polaris created itself can be reopened (retry flow)
+  const mine = Workspace.create("mine", tmp);
+  mine.writeFile("code.py", "print(1)");
+  expect(() => Workspace.create("mine", tmp)).not.toThrow();
+
+  // modify mode explicitly adopts an existing directory
+  expect(() => Workspace.create("foreign", tmp, "modify")).not.toThrow();
+
+  // file operations cannot escape the workspace
+  expect(() => mine.writeFile("../escape.txt", "x")).toThrow(/escapes the workspace/);
+  expect(() => mine.writeFile("/tmp/escape.txt", "x")).toThrow(/escapes the workspace/);
+  await expect(mine.readFile("../escape.txt")).rejects.toThrow(/escapes the workspace/);
+
+  // marker + askpass files stay out of listings
+  const listing = await mine.listFiles(".");
+  expect(listing).toContain("code.py");
+  expect(listing).not.toContain(".polaris-workspace");
+
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test("searchPolarisPapers returns no results when a direct id lookup misses", async () => {
+  // The regression: an id miss fell through to the "list recent repos" branch,
+  // letting reuse_if_exists return an unrelated implementation.
+  try {
+    const matches = await searchPolarisPapers({ arxiv_id: "0000.00001" });
+    expect(matches).toEqual([]);
+  } catch (e) {
+    console.warn("searchPolarisPapers id-miss skipped (network/rate-limit):", (e as Error).message);
+  }
+});
+
+test("titleMatchConfidence separates verified matches from keyword noise", () => {
+  const repo = {
+    repo_name: "paper-1706-03762",
+    arxiv_id: "1706.03762",
+    description: "Attention Is All You Need — transformer encoder-decoder reproduction",
+    html_url: "",
+    updated_at: "",
+    stars: 0,
+  };
+  expect(titleMatchConfidence("Attention Is All You Need", repo)).toBeGreaterThanOrEqual(TITLE_MATCH_THRESHOLD);
+  const unrelated = { ...repo, repo_name: "paper-2301.99999", description: "Diffusion models for image generation" };
+  expect(titleMatchConfidence("Attention Is All You Need", unrelated)).toBeLessThan(TITLE_MATCH_THRESHOLD);
+});
+
+test("defaultRepoName gives every paper a distinct, safe workspace name", () => {
+  // arXiv papers follow the library convention
+  expect(defaultRepoName("2106.09685", "LoRA", "job-1")).toBe("paper-2106-09685");
+  // id-less uploads derive a stable title slug instead of sharing "paper-unknown"
+  expect(defaultRepoName("", "Attention Is All You Need", "job-a")).toBe("paper-attention-is-all-you-need");
+  expect(defaultRepoName("", "Neural Ordinary Differential Equations", "job-b")).toBe(
+    "paper-neural-ordinary-differential-equations",
+  );
+  expect(defaultRepoName("", "Attention Is All You Need", "job-a")).not.toBe(
+    defaultRepoName("", "Neural Ordinary Differential Equations", "job-b"),
+  );
+  // no id + no title → unique job-derived names (real job uuids are UUIDs)
+  const uuid1 = crypto.randomUUID();
+  const uuid2 = crypto.randomUUID();
+  expect(defaultRepoName("", "", uuid1)).toMatch(/^paper-[0-9a-f]{8}$/);
+  expect(defaultRepoName("", "", uuid1)).not.toBe(defaultRepoName("", "", uuid2));
+  expect(slugifyTitle("Attention Is All You Need")).toBe("attention-is-all-you-need");
+  expect(slugifyTitle("ab")).toBe("");
+});
+
+test("parseStrictBool never truthy-coerces the string \"false\"", async () => {
+  const { parseStrictBool } = await import("../src/server/server.ts");
+  expect(parseStrictBool(true)).toBe(true);
+  expect(parseStrictBool("true")).toBe(true);
+  expect(parseStrictBool("1")).toBe(true);
+  expect(parseStrictBool(1)).toBe(true);
+  expect(parseStrictBool(false)).toBe(false);
+  expect(parseStrictBool("false")).toBe(false);
+  expect(parseStrictBool("0")).toBe(false);
+  expect(parseStrictBool(undefined)).toBeUndefined();
+  expect(parseStrictBool(null)).toBeUndefined();
+  expect(parseStrictBool("yes")).toBeUndefined();
+});
+
+test("extractSandboxPaths parses trueForge sandbox artifact blocks", async () => {
+  const { extractSandboxPaths } = await import("../src/trueforge/engine.ts");
+  const content = [
+    { type: "text", content: "Implementation complete." },
+    {
+      type: "sandbox_artifacts",
+      content: "[train.py](/workspace/train.py)\n[model.py](/workspace/src/model.py)\n[junk](/workspace/.git/config)",
+    },
+  ];
+  expect(extractSandboxPaths(content)).toEqual(["workspace/train.py", "workspace/src/model.py"]);
+  expect(extractSandboxPaths("plain string")).toEqual([]);
+  expect(extractSandboxPaths([{ type: "text", content: "no artifacts" }])).toEqual([]);
 });

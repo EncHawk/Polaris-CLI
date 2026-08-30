@@ -37,7 +37,7 @@ Ported the full polaris paper-reproduction pipeline (Python/LangGraph → TypeSc
 ### Verified
 
 - `bunx tsc --noEmit` — clean
-- `bun test` — 17/17 pass
+- `bun test` — 26/26 pass (incl. regression tests for all Qodo findings)
 - `polaris doctor` — config check works
 - `polaris mcp` — MCP initialize + tools/list handshake works over stdio
 - `polaris serve` — web page served (Bun bundler transpiles React), API endpoints work
@@ -45,9 +45,26 @@ Ported the full polaris paper-reproduction pipeline (Python/LangGraph → TypeSc
 
 ### Not yet wired
 
-- `TrueForgeEngine.runTrueForgeAgentTurn` is implemented but not yet wired into the graph driver as an alternative to the local loop. To use it: swap `runAgenticCall` for `runTrueForgeAgentTurn` in each agent's run function when a trueForge server is available.
 - Daytona REST exec in the local sandbox — currently stubbed; managed Daytona comes via trueForge's sandbox-as-tool when using `polaris serve --tf`.
 - Usage/billing reporting (polaris `usage.py`) — not ported (BYOK = user pays their provider directly).
+
+### Qodo review remediations (PR #1)
+
+All 11 findings from the Qodo code review were fixed:
+
+1. **ID-miss reuses arbitrary repo** — `searchPolarisPapers` no longer falls through to the recent-repos listing when a direct arXiv lookup misses; it returns no results instead.
+2. **trueForge CODE output discarded** — the CODE turn's `sandbox_artifacts` are downloaded via `client.sessions.downloadSandboxFile` and bridged into the pipeline workspace (persist + checkpoint + publish), with a trueForge-specific system-prompt addendum; `ready` now requires actual output.
+3. **File path becomes arXiv id** — the CLI arg parser knows value-taking flags, so `polaris run --file paper.pdf` no longer sets the id to `paper.pdf`.
+4. **Repo path leaks host files** — repo names are sanitized to one safe path component, the workspace is confined to the output root, file ops can't escape the workspace, and create mode refuses unowned non-empty directories (`.polaris-workspace` marker; excluded from git pushes and listings).
+5. **ID-less uploads share a workspace** — runs without an arXiv id derive a stable title slug (`paper-attention-is-all-you-need`) or a unique job-derived name; the shared `paper-unknown` default is gone.
+6. **Search result falsely proves match** — title-search hits only count as `found` at ≥80% title-token overlap; fuzzy hits come back as candidates only.
+7. **Uploads can exhaust memory** — bodies over `POLARIS_MAX_UPLOAD_MB` (default 25) get 413 before buffering; extracted text caps at `POLARIS_MAX_PAPER_CHARS` (default 600k).
+8. **Invalid engine silently runs local** — `parseEngine` rejects anything but `local|trueforge` at every entry point (CLI, server JSON/multipart, runOne).
+9. **trueForge not started for CLI runs** — `polaris run --engine trueforge` boots + provisions the harness and a standalone MCP endpoint (`POLARIS_MCP_PORT`), tearing both down afterwards; the agent-server also got its own port (`POLARIS_PORT`, default 8788) so it never collides with trueForge (8790), and provisioning now points at OUR `/mcp`.
+10. **Implementation file paths unencoded** — GitHub content paths are per-segment URL-encoded, so filenames with `#`/`?` work.
+11. **reuse flag truthiness** — strict boolean parsing (`"false"` ≠ true); invalid values get 400.
+
+Also fixed while in there: `POLARIS_TRUEFORGE_BASE_URL ?? url` empty-string fallthrough bugs (doctor/setup/agent), and `cmdSetup` no longer points the polaris MCP at trueForge's own URL.
 
 ### Key design decisions
 

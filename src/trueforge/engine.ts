@@ -25,6 +25,39 @@ export interface TrueForgeTurnResult {
   text: string;
   structured: Record<string, unknown> | null;
   status: string;
+  /**
+   * Files the agent created in the trueForge sandbox (from the assistant's
+   * `sandbox_artifacts` block), downloaded back so the caller can bridge them
+   * into the pipeline workspace. Only present for sandboxed (CODE) turns.
+   */
+  sandboxFiles?: Array<{ path: string; contents: string }>;
+}
+
+/** Max sandbox files bridged per turn / max bytes per file. */
+const MAX_SANDBOX_FILES = 100;
+const MAX_SANDBOX_FILE_BYTES = 2 * 1024 * 1024;
+const SANDBOX_SKIP_DIRS = [".git", "node_modules", ".venv", "__pycache__", "dist", "build"];
+
+/**
+ * Extract sandbox file paths from the assistant's `sandbox_artifacts` content
+ * block. The block lists files as markdown links: `[name](/absolute/path)`.
+ * (The part type isn't in the SDK's public TS surface, so parse defensively.)
+ */
+export function extractSandboxPaths(content: unknown): string[] {
+  const parts = Array.isArray(content) ? content : [];
+  const paths: string[] = [];
+  for (const part of parts) {
+    const p = part as { type?: string; content?: unknown };
+    if (p?.type !== "sandbox_artifacts" || typeof p.content !== "string") continue;
+    for (const m of p.content.matchAll(/\[([^\]]*)\]\(([^)\s]+)\)/g)) {
+      const raw = m[2]!.trim();
+      const rel = raw.replace(/^\/+/, "");
+      if (!rel || rel.startsWith("..")) continue;
+      if (rel.split("/").some((seg) => SANDBOX_SKIP_DIRS.includes(seg))) continue;
+      paths.push(rel);
+    }
+  }
+  return [...new Set(paths)];
 }
 
 export async function runTrueForgeAgentTurn(
@@ -59,6 +92,8 @@ export async function runTrueForgeAgentTurn(
 
   let lastText = "";
   let status = "running";
+  let turnId = "";
+  const sandboxPaths = new Set<string>();
 
   for await (const { data: event } of stream.withMetadata()) {
     if (isEventDelta(event)) {
@@ -76,6 +111,7 @@ export async function runTrueForgeAgentTurn(
 
     switch (event.type) {
       case "turn.created":
+        turnId = event.turnId;
         step(p.jobUuid, p.agentEnum, "turn-created", { tool: "trueforge" });
         break;
       case "mcp.initialize":
@@ -86,6 +122,7 @@ export async function runTrueForgeAgentTurn(
         break;
       case "model.message":
         if (event.content && typeof event.content === "string") lastText = event.content;
+        for (const path of extractSandboxPaths(event.content)) sandboxPaths.add(path);
         if (event.toolCalls?.length) {
           for (const tc of event.toolCalls) {
             step(p.jobUuid, p.agentEnum, `tool-call:${tc.toolInfo.name}`, {
@@ -121,7 +158,8 @@ export async function runTrueForgeAgentTurn(
         if (status === "done") {
           const done = event.state as TrueForgeApi.TurnStateDone;
           if (done.output?.type === "model.message") {
-            lastText = (done.output.content as string) ?? lastText;
+            if (typeof done.output.content === "string") lastText = done.output.content;
+            for (const path of extractSandboxPaths(done.output.content)) sandboxPaths.add(path);
           }
         }
         step(p.jobUuid, p.agentEnum, "completed", {
@@ -151,5 +189,39 @@ export async function runTrueForgeAgentTurn(
     }
   }
 
-  return { text: lastText, structured, status };
+  // Bridge sandbox output back into the pipeline: download every artifact the
+  // CODE agent created in the trueForge sandbox so the caller can persist and
+  // publish it. Without this, files stay stranded in the sandbox and the run
+  // reports "code produced no output".
+  const sandboxFiles: Array<{ path: string; contents: string }> = [];
+  if (sandboxPaths.size > 0 && turnId) {
+    for (const path of [...sandboxPaths].slice(0, MAX_SANDBOX_FILES)) {
+      try {
+        const resp = await client.sessions.downloadSandboxFile(session.id, turnId, { path });
+        const buf = await resp.arrayBuffer();
+        if (buf.byteLength > MAX_SANDBOX_FILE_BYTES) {
+          step(p.jobUuid, p.agentEnum, "sandbox-bridge-skip", {
+            tool: "trueforge:sandbox",
+            conclusion: `skipped ${path} (${buf.byteLength} bytes > ${MAX_SANDBOX_FILE_BYTES})`,
+          });
+          continue;
+        }
+        sandboxFiles.push({ path, contents: new TextDecoder("utf-8", { fatal: false }).decode(buf) });
+      } catch (e) {
+        step(p.jobUuid, p.agentEnum, "sandbox-bridge-skip", {
+          tool: "trueforge:sandbox",
+          conclusion: `failed to download ${path}: ${(e as Error).message}`,
+        });
+      }
+    }
+    if (sandboxFiles.length > 0) {
+      step(p.jobUuid, p.agentEnum, "sandbox-bridged", {
+        tool: "trueforge:sandbox",
+        conclusion: `downloaded ${sandboxFiles.length} file(s) into the pipeline workspace`,
+        output_query: sandboxFiles.map((f) => f.path).join(", ").slice(0, 300),
+      });
+    }
+  }
+
+  return { text: lastText, structured, status, sandboxFiles };
 }

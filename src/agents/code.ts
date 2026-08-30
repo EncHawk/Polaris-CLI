@@ -2,13 +2,13 @@ import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
 import type { WorkerState, CodeOutput, CodeFile, RunLog } from "../state.ts";
 import { markAgentRun } from "../state.ts";
 import { status, step, output } from "../pipeline/trace.ts";
-import { runAgentTurn } from "../agents_util/engine.ts";
+import { runAgentTurn, type EngineType } from "../agents_util/engine.ts";
 import { chatCompletion } from "../agents_util/llm.ts";
 import { getSettings } from "../config/settings.ts";
-import { Workspace } from "../tools/workspace.ts";
+import { Workspace, sanitizeRepoName } from "../tools/workspace.ts";
 import { GitHubRepository } from "../tools/github.ts";
 import { saveCodeCheckpoint, loadLatestCheckpoint, deleteCheckpoints } from "../agents_util/checkpoint.ts";
-import { implementationRepoName } from "../tools/upload.ts";
+import { defaultRepoName, extractTitle } from "../tools/upload.ts";
 
 export const CODE_SYSTEM_PROMPT = `You are the CODE agent for an automated paper-reproduction pipeline.
 Implement the paper's claim in PyTorch (or raw Python where the paper specifies).
@@ -33,6 +33,20 @@ Available tools:
 - mark_implementation_complete: Call this when the implementation is done and working
 
 Start by understanding the plan, then implement files one by one.`;
+
+/**
+ * Appended to the CODE system prompt when the turn runs on the trueForge
+ * engine: the local write_file/run_command tools do not exist there, so the
+ * agent builds inside the trueForge sandbox instead and the pipeline bridges
+ * the sandbox artifacts back into the workspace.
+ */
+export const CODE_TRUEFORGE_ADDENDUM = `
+
+EXECUTION ENVIRONMENT (trueForge sandbox):
+You are running inside a trueForge sandbox, not the local polaris workspace. Do NOT call write_file, read_file, run_command, or list_files — they are not available here. Instead:
+1. Use the sandbox's built-in file and command tools to create each project file and run commands to verify they work.
+2. Every file you create in the sandbox is automatically downloaded into the user's project directory and published to GitHub by the polaris pipeline when you finish.
+3. When all files are implemented and working, call mark_implementation_complete with files_written listing every file you created (relative paths).`;
 
 export const CODE_TOOLS: ToolDef[] = [
   {
@@ -161,15 +175,24 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     null, 2,
   ).slice(0, 4000);
 
-  const workspace = Workspace.create(
-    state.repo_name || implementationRepoName(state.arxiv_id ?? "", `paper-${state.arxiv_id ?? "unknown"}`),
-    state.output_dir,
+  // One canonical repo/workspace name, sanitized up front so the GitHub repo
+  // and the on-disk directory always agree. Papers without an arXiv id derive
+  // a stable title slug (or a unique job-derived name) instead of all sharing
+  // one "paper-unknown" workspace.
+  const repoName = sanitizeRepoName(
+    state.repo_name || defaultRepoName(state.arxiv_id ?? "", extractTitle(state.markdown ?? ""), jobUuid),
   );
+  const executionModeRaw = state.execution_mode ?? "create";
+  const executionMode = (["create", "modify", "run"] as const).includes(
+    executionModeRaw as "create" | "modify" | "run",
+  )
+    ? (executionModeRaw as "create" | "modify" | "run")
+    : "create";
+  const existing = !!state.repo_exists || executionMode === "modify" || executionMode === "run";
+  const engine: EngineType = state.engine ?? "local";
+  const workspace = Workspace.create(repoName, state.output_dir, existing ? "modify" : executionMode);
   const hasGithub = !!s.GITHUB_ACCESS_TOKEN;
   const repo = hasGithub ? new GitHubRepository() : null;
-  const repoName = state.repo_name || implementationRepoName(state.arxiv_id ?? "", `paper-${state.arxiv_id ?? "unknown"}`);
-  const executionMode = state.execution_mode ?? "create";
-  const existing = !!state.repo_exists || executionMode === "modify" || executionMode === "run";
   let githubUrl = state.github_url || (repo ? repo.htmlUrl(repoName) : "");
   const accumulatedLogs: RunLog[] = [];
   let pushError = "";
@@ -242,7 +265,11 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     write_file: async (args: ToolArgs) => {
       const path = String(args["file_path"] ?? "");
       const content = String(args["content"] ?? "");
-      workspace.writeFile(path, content);
+      try {
+        workspace.writeFile(path, content);
+      } catch (e) {
+        return `Error writing ${path}: ${(e as Error).message}`;
+      }
       codeFiles.push({ path, contents: content });
       const allFiles: Record<string, string> = {};
       for (const f of codeFiles) allFiles[f.path] = f.contents;
@@ -295,7 +322,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
 
   const result = await runAgentTurn({
     agentName: "CODE",
-    systemPrompt: CODE_SYSTEM_PROMPT,
+    systemPrompt: CODE_SYSTEM_PROMPT + (engine === "trueforge" ? CODE_TRUEFORGE_ADDENDUM : ""),
     userMessage,
     tools: CODE_TOOLS,
     toolHandlers: handlers,
@@ -303,9 +330,27 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     agentEnum: "CODE",
     maxTokens: s.AGENT_MAX_STEPS * 8192,
     conversationHistory,
-    engine: (state.engine as "local" | "trueforge") ?? "local",
+    engine,
   });
   data = result.structured;
+
+  // trueForge engine: bridge the sandbox artifacts into the pipeline workspace
+  // so the files are persisted, checkpointed, and published exactly like
+  // locally-written files.
+  for (const f of result.sandboxFiles ?? []) {
+    try {
+      workspace.writeFile(f.path, f.contents);
+      if (!codeFiles.some((cf) => cf.path === f.path)) codeFiles.push({ path: f.path, contents: f.contents });
+      const allFiles: Record<string, string> = {};
+      for (const cf of codeFiles) allFiles[cf.path] = cf.contents;
+      saveCodeCheckpoint(userId, paperId, jobUuid, allFiles);
+    } catch (e) {
+      step(jobUuid, "CODE", "sandbox-bridge-write-failed", {
+        tool: "workspace",
+        conclusion: `could not write ${f.path}: ${(e as Error).message}`,
+      });
+    }
+  }
 
   if (codeFiles.length === 0) {
     pushError = "code produced no output";
@@ -356,7 +401,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     files: codeFiles,
     run_logs: accumulatedLogs,
     notes: String(d["summary"] ?? d["caveats"] ?? ""),
-    ready: data != null,
+    ready: data != null && codeFiles.length > 0,
     output_query: String(d["summary"] ?? "code produced output"),
     github_url: githubUrl,
     repo_name: repoName,

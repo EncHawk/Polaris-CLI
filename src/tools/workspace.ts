@@ -10,8 +10,8 @@
  * This replaces the polaris-backend's Daytona sandbox + Supabase mirror — the
  * CLI runs fully standalone on the user's machine.
  */
-import { mkdirSync, existsSync, readdirSync, statSync } from "node:fs";
-import { dirname, join, resolve, relative, isAbsolute } from "node:path";
+import { mkdirSync, existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, relative, isAbsolute, sep } from "node:path";
 import { getSettings } from "../config/settings.ts";
 import { exec as localExec } from "./local-exec.ts";
 
@@ -19,6 +19,30 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   returncode: number;
+}
+
+/** Marker file proving a directory was created/adopted by polaris. */
+const MARKER_FILE = ".polaris-workspace";
+
+/**
+ * Reduce a user-controlled repo name to a safe single path component.
+ * Rejects path separators, traversal fragments, and anything that would not
+ * survive as a GitHub repo name, so a crafted `repo_name` can never point the
+ * workspace (and its `git add -A && git push`) at an arbitrary host directory.
+ */
+export function sanitizeRepoName(input: string): string {
+  const base = input.split(/[/\\]/).pop() ?? "";
+  const cleaned = base
+    .replace(/[^A-Za-z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[._-]+/, "")
+    .replace(/[._-]+$/, "")
+    .slice(0, 100)
+    .replace(/[._-]+$/, "");
+  if (!cleaned || cleaned === "." || cleaned === "..") {
+    throw new Error(`Invalid repository name: "${input}" (expected a simple GitHub-safe name like paper-2106-09685)`);
+  }
+  return cleaned;
 }
 
 export class Workspace {
@@ -34,17 +58,49 @@ export class Workspace {
    * Create (or open) a project directory for a reproduction.
    * `outputDir` overrides `POLARIS_OUTPUT_DIR`; defaults to the current
    * working directory. The repo directory is `./<repoName>/`.
+   *
+   * The name is sanitized to a single safe component and the resolved
+   * directory is asserted to stay under the output root. In `create` mode an
+   * already-existing non-empty directory that polaris does not own (no
+   * `.polaris-workspace` marker) is refused, so a run can never commit and
+   * push an unrelated host directory.
    */
-  static create(repoName: string, outputDir?: string): Workspace {
+  static create(repoName: string, outputDir?: string, mode: "create" | "modify" | "run" = "create"): Workspace {
     const s = getSettings();
-    const base = outputDir ?? s.POLARIS_OUTPUT_DIR ?? ".";
-    const dir = resolve(base, repoName);
+    const base = resolve(outputDir || s.POLARIS_OUTPUT_DIR || ".");
+    const safe = sanitizeRepoName(repoName);
+    const dir = resolve(base, safe);
+    if (dir !== base && !dir.startsWith(base + sep)) {
+      throw new Error(`Workspace path escapes the output directory: ${dir} (base: ${base})`);
+    }
+    if (mode === "create" && existsSync(dir) && !this.isOwned(dir)) {
+      const entries = readdirSync(dir).filter((e) => e !== MARKER_FILE);
+      if (entries.length > 0) {
+        throw new Error(
+          `Directory ${dir} already exists and is not empty (not created by polaris). ` +
+            `Use a different --repo/--output, or --mode modify/run to work inside it.`,
+        );
+      }
+    }
     mkdirSync(dir, { recursive: true });
-    return new Workspace(dir, repoName);
+    if (mode !== "run") {
+      const marker = join(dir, MARKER_FILE);
+      if (!existsSync(marker)) writeFileSync(marker, `polaris workspace: ${safe}\n`);
+    }
+    return new Workspace(dir, safe);
   }
 
+  private static isOwned(dir: string): boolean {
+    return existsSync(join(dir, MARKER_FILE));
+  }
+
+  /** Resolve `path` inside the workspace; throws if it would escape the workspace. */
   private abs(path: string): string {
-    return isAbsolute(path) ? path : join(this.workdir, path);
+    const p = isAbsolute(path) ? path : join(this.workdir, path);
+    if (p !== this.workdir && !p.startsWith(this.workdir + sep)) {
+      throw new Error(`Path escapes the workspace: ${path}`);
+    }
+    return p;
   }
 
   writeFile(path: string, contents: string): string {
@@ -71,7 +127,7 @@ export class Workspace {
     const walk = (d: string, depth = 0): void => {
       if (depth > 5) return;
       for (const name of readdirSync(d)) {
-        if (name === ".git" || name === "node_modules") continue;
+        if (name === ".git" || name === "node_modules" || name === MARKER_FILE || name === ".polaris_git_askpass") continue;
         const p = join(d, name);
         const rel = relative(this.workdir, p);
         try {
@@ -122,7 +178,7 @@ export class Workspace {
       `GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Polaris GIT_AUTHOR_EMAIL=bot@polaris.local ` +
       `GIT_COMMITTER_NAME=Polaris GIT_COMMITTER_EMAIL=bot@polaris.local; `;
     const result = await this.exec(
-      `${env}git add -A -- ':!.polaris_git_askpass' && ` +
+      `${env}git add -A -- ':!.polaris_git_askpass' ':!${MARKER_FILE}' && ` +
         `(${env}git diff --cached --quiet || ${env}git commit -m ${shQuote(commitMessage)}) && ` +
         `${env}git push -u origin HEAD:main`,
       300,

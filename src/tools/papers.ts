@@ -138,11 +138,15 @@ export interface SearchOpts {
 export async function searchPolarisPapers(opts: SearchOpts): Promise<PaperRepo[]> {
   const limit = opts.limit ?? 10;
   const aid = opts.arxiv_id ? normalizeId(opts.arxiv_id) : "";
+  const q = (opts.query ?? "").trim();
   if (aid) {
     const r = await ghFetch(`${apiBase()}/repos/${org()}/${arxivIdToRepoName(aid)}`);
     if (r.ok) return [toPaperRepo((await r.json()) as GhRepoJson)];
+    // A direct arXiv lookup missed. Callers asking by id expect "the repo for
+    // this paper or nothing" — never fall through to a listing/search that
+    // would return unrelated repositories as if they matched.
+    if (!q) return [];
   }
-  const q = (opts.query ?? "").trim();
   if (!q) {
     const repos = await listPolarisRepos();
     return repos.slice(0, limit);
@@ -174,7 +178,7 @@ export async function searchPolarisPapers(opts: SearchOpts): Promise<PaperRepo[]
 /** Recursive file tree for an implementation repo. */
 export async function getImplementationTree(repoName: string): Promise<PaperFile[]> {
   const o = org();
-  const r = await ghFetch(`${apiBase()}/repos/${o}/${repoName}/git/trees/HEAD?recursive=1`);
+  const r = await ghFetch(`${apiBase()}/repos/${o}/${encodeURIComponent(repoName)}/git/trees/HEAD?recursive=1`);
   if (!r.ok) throw new Error(`GitHub tree fetch failed for ${repoName}: ${r.status}`);
   const j = (await r.json()) as { tree: Array<{ path: string; type: string; size?: number }> };
   return (j.tree ?? []).map((n) => ({
@@ -184,10 +188,21 @@ export async function getImplementationTree(repoName: string): Promise<PaperFile
   }));
 }
 
+/** URL-encode a repo-qualified content path segment-by-segment (keeps `/`). */
+function encodeContentPath(path: string): string {
+  return path
+    .split("/")
+    .filter((p) => p !== "" && p !== "." && p !== "..")
+    .map((p) => encodeURIComponent(p))
+    .join("/");
+}
+
 /** Fetch a single file's decoded content from an implementation repo. */
 export async function getImplementationFile(repoName: string, filePath: string): Promise<string> {
   const o = org();
-  const r = await ghFetch(`${apiBase()}/repos/${o}/${repoName}/contents/${filePath}`);
+  const encoded = encodeContentPath(filePath);
+  if (!encoded) throw new Error(`Invalid file path: ${filePath}`);
+  const r = await ghFetch(`${apiBase()}/repos/${o}/${encodeURIComponent(repoName)}/contents/${encoded}`);
   if (!r.ok) throw new Error(`GitHub file fetch failed for ${repoName}:${filePath}: ${r.status}`);
   const j = (await r.json()) as { content?: string; encoding?: string };
   if (j.encoding === "base64" && j.content) {
@@ -230,7 +245,7 @@ export async function getImplementation(repoName: string, maxFiles = 40): Promis
     }
   }
 
-  const r = await ghFetch(`${apiBase()}/repos/${o}/${repoName}`);
+  const r = await ghFetch(`${apiBase()}/repos/${o}/${encodeURIComponent(repoName)}`);
   const meta = r.ok ? ((await r.json()) as GhRepoJson) : null;
 
   return {
