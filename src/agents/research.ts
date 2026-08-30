@@ -2,17 +2,19 @@ import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
 import type { WorkerState, ResearchOutput, ResearchCitation, RelevantCitation } from "../state.ts";
 import { markAgentRun } from "../state.ts";
 import { status } from "../pipeline/trace.ts";
-import { runAgenticCall } from "../agents_util/loop.ts";
+import { runAgentTurn } from "../agents_util/engine.ts";
 import { getSettings } from "../config/settings.ts";
 import { searchId, searchTitle } from "../tools/arxiv.ts";
+import { searchPolarisPapers } from "../tools/papers.ts";
 
 export const RESEARCH_SYSTEM_PROMPT = `You are the RESEARCH agent for an automated paper-reproduction pipeline.
 The READ agent has already extracted a list of relevant citations from the paper.
 
 Your job:
 1. For each citation, use the \`search_arxiv\` tool to fetch its abstract and metadata.
-2. Analyze what each citation claims and how the main paper uses it.
-3. When you have analyzed ALL citations, call \`complete_research\` with your findings.
+2. Check whether a citation already has a coded implementation in the Polaris library using \`search_polaris_papers\` (pass the citation's arxiv_id). If one exists, note its repo_name and GitHub URL in how_used so the CODE agent can reuse it.
+3. Analyze what each citation claims and how the main paper uses it.
+4. When you have analyzed ALL citations, call \`complete_research\` with your findings.
 
 Be thorough but concise. Cover every citation the READ agent surfaced.
 If a citation lacks an arxiv_id, try searching by title.`;
@@ -35,6 +37,22 @@ export const RESEARCH_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
+      name: "search_polaris_papers",
+      description:
+        "Search the Polaris coded-implementation library for an existing reproduction of a paper. " +
+        "Pass a citation's arxiv_id to check if it already has a coded implementation that the CODE agent can reuse.",
+      parameters: {
+        type: "object",
+        properties: {
+          arxiv_id: { type: "string", description: "ArXiv ID to look up directly" },
+          query: { type: "string", description: "Free-text search over repo names and descriptions" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "complete_research",
       description: "Call this when you have analyzed all citations. Submits the final research results.",
       parameters: {
@@ -47,7 +65,7 @@ export const RESEARCH_TOOLS: ToolDef[] = [
               properties: {
                 arxiv_id: { type: "string" },
                 what_it_claims: { type: "string", description: "What the cited paper does and claims" },
-                how_used: { type: "string", description: "How the main paper uses this citation" },
+                how_used: { type: "string", description: "How the main paper uses this citation (note any existing Polaris implementation repo_name/url here)" },
               },
             },
           },
@@ -89,6 +107,29 @@ export async function runResearch(state: WorkerState): Promise<Partial<WorkerSta
       }
       return JSON.stringify({ arxiv_id: aid, title: "", abstract: "Not found" });
     },
+    search_polaris_papers: async (args: ToolArgs) => {
+      try {
+        const matches = await searchPolarisPapers({
+          arxiv_id: args["arxiv_id"] ? String(args["arxiv_id"]) : undefined,
+          query: args["query"] ? String(args["query"]) : undefined,
+          limit: 5,
+        });
+        if (matches.length === 0) {
+          return JSON.stringify({ found: 0, message: "No existing coded implementation for this paper." });
+        }
+        return JSON.stringify({
+          found: matches.length,
+          implementations: matches.map((m) => ({
+            arxiv_id: m.arxiv_id,
+            repo_name: m.repo_name,
+            html_url: m.html_url,
+            description: m.description,
+          })),
+        });
+      } catch (e) {
+        return JSON.stringify({ found: 0, error: (e as Error).message });
+      }
+    },
     complete_research: async (args: ToolArgs) => {
       data = args;
       return "Research results recorded.";
@@ -109,7 +150,7 @@ export async function runResearch(state: WorkerState): Promise<Partial<WorkerSta
     });
   }
 
-  await runAgenticCall({
+  const result = await runAgentTurn({
     agentName: "RESEARCH",
     systemPrompt: RESEARCH_SYSTEM_PROMPT,
     userMessage,
@@ -119,7 +160,9 @@ export async function runResearch(state: WorkerState): Promise<Partial<WorkerSta
     agentEnum: "RESEARCH",
     maxTokens: s.AGENT_MAX_STEPS * 4096,
     conversationHistory,
+    engine: (state.engine as "local" | "trueforge") ?? "local",
   });
+  data = result.structured;
 
   const notes: ResearchCitation[] = [];
   if (data) {

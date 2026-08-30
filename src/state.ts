@@ -111,6 +111,12 @@ export interface WorkerState {
   orchestrator_feedback?: string;
   /** Skip the human plan-approval gate (used by the MCP server / non-interactive runs). */
   auto_approve?: boolean;
+  /** Execution engine: "local" (BYOK ReAct loop) or "trueforge" (harness). */
+  engine?: import("./agents_util/engine.ts").EngineType;
+  /** Directory to create the project in (defaults to POLARIS_OUTPUT_DIR or cwd). */
+  output_dir?: string;
+  /** If an existing library implementation was found, its repo info (so CODE can reuse). */
+  library_hit?: { repo_name: string; html_url: string; arxiv_id: string } | null;
 }
 
 export interface TraceSummary {

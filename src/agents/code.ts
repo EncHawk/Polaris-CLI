@@ -2,17 +2,18 @@ import type { ToolDef, ToolArgs, ToolHandlers, ChatMessage } from "./types.ts";
 import type { WorkerState, CodeOutput, CodeFile, RunLog } from "../state.ts";
 import { markAgentRun } from "../state.ts";
 import { status, step, output } from "../pipeline/trace.ts";
-import { runAgenticCall } from "../agents_util/loop.ts";
+import { runAgentTurn, type EngineType } from "../agents_util/engine.ts";
 import { chatCompletion } from "../agents_util/llm.ts";
 import { getSettings } from "../config/settings.ts";
-import { Sandbox } from "../tools/sandbox.ts";
+import { Workspace, sanitizeRepoName } from "../tools/workspace.ts";
 import { GitHubRepository } from "../tools/github.ts";
 import { saveCodeCheckpoint, loadLatestCheckpoint, deleteCheckpoints } from "../agents_util/checkpoint.ts";
+import { defaultRepoName, extractTitle } from "../tools/upload.ts";
 
 export const CODE_SYSTEM_PROMPT = `You are the CODE agent for an automated paper-reproduction pipeline.
 Implement the paper's claim in PyTorch (or raw Python where the paper specifies).
 
-You have access to a sandboxed Linux environment with Python and common ML libraries.
+You write files directly to a project directory on the user's filesystem. Python and common ML libraries are available.
 
 Rules:
 1. Implement files ONE AT A TIME following the plan order.
@@ -25,20 +26,34 @@ Rules:
 8. When all files are implemented and working, call mark_implementation_complete.
 
 Available tools:
-- write_file: Write a file to the sandbox workspace (provide file_path and content)
-- read_file: Read a file from the sandbox workspace
-- run_command: Run a shell command in the sandbox (provide command, optional timeout)
-- list_files: List files in the sandbox workspace (optional directory filter)
+- write_file: Write a file to the project directory (provide file_path and content)
+- read_file: Read a file from the project directory
+- run_command: Run a shell command in the project directory (provide command, optional timeout)
+- list_files: List files in the workspace workspace (optional directory filter)
 - mark_implementation_complete: Call this when the implementation is done and working
 
 Start by understanding the plan, then implement files one by one.`;
+
+/**
+ * Appended to the CODE system prompt when the turn runs on the trueForge
+ * engine: the local write_file/run_command tools do not exist there, so the
+ * agent builds inside the trueForge sandbox instead and the pipeline bridges
+ * the sandbox artifacts back into the workspace.
+ */
+export const CODE_TRUEFORGE_ADDENDUM = `
+
+EXECUTION ENVIRONMENT (trueForge sandbox):
+You are running inside a trueForge sandbox, not the local polaris workspace. Do NOT call write_file, read_file, run_command, or list_files — they are not available here. Instead:
+1. Use the sandbox's built-in file and command tools to create each project file and run commands to verify they work.
+2. Every file you create in the sandbox is automatically downloaded into the user's project directory and published to GitHub by the polaris pipeline when you finish.
+3. When all files are implemented and working, call mark_implementation_complete with files_written listing every file you created (relative paths).`;
 
 export const CODE_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
       name: "write_file",
-      description: "Write a file to the sandbox workspace. Creates parent directories automatically.",
+      description: "Write a file to the workspace workspace. Creates parent directories automatically.",
       parameters: {
         type: "object",
         properties: {
@@ -53,7 +68,7 @@ export const CODE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read a file from the sandbox workspace.",
+      description: "Read a file from the workspace workspace.",
       parameters: {
         type: "object",
         properties: {
@@ -67,7 +82,7 @@ export const CODE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "run_command",
-      description: "Run a shell command in the sandbox. Returns stdout + stderr + return code.",
+      description: "Run a shell command in the workspace. Returns stdout + stderr + return code.",
       parameters: {
         type: "object",
         properties: {
@@ -82,7 +97,7 @@ export const CODE_TOOLS: ToolDef[] = [
     type: "function",
     function: {
       name: "list_files",
-      description: "List files in the sandbox workspace directory.",
+      description: "List files in the workspace workspace directory.",
       parameters: {
         type: "object",
         properties: {
@@ -160,12 +175,24 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     null, 2,
   ).slice(0, 4000);
 
-  const sandbox = Sandbox.create(jobUuid);
+  // One canonical repo/workspace name, sanitized up front so the GitHub repo
+  // and the on-disk directory always agree. Papers without an arXiv id derive
+  // a stable title slug (or a unique job-derived name) instead of all sharing
+  // one "paper-unknown" workspace.
+  const repoName = sanitizeRepoName(
+    state.repo_name || defaultRepoName(state.arxiv_id ?? "", extractTitle(state.markdown ?? ""), jobUuid),
+  );
+  const executionModeRaw = state.execution_mode ?? "create";
+  const executionMode = (["create", "modify", "run"] as const).includes(
+    executionModeRaw as "create" | "modify" | "run",
+  )
+    ? (executionModeRaw as "create" | "modify" | "run")
+    : "create";
+  const existing = !!state.repo_exists || executionMode === "modify" || executionMode === "run";
+  const engine: EngineType = state.engine ?? "local";
+  const workspace = await Workspace.create(repoName, state.output_dir, existing ? "modify" : executionMode);
   const hasGithub = !!s.GITHUB_ACCESS_TOKEN;
   const repo = hasGithub ? new GitHubRepository() : null;
-  const repoName = state.repo_name || `paper-${state.arxiv_id ?? "unknown"}`;
-  const executionMode = state.execution_mode ?? "create";
-  const existing = !!state.repo_exists || executionMode === "modify" || executionMode === "run";
   let githubUrl = state.github_url || (repo ? repo.htmlUrl(repoName) : "");
   const accumulatedLogs: RunLog[] = [];
   let pushError = "";
@@ -174,9 +201,9 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     try {
       const remote = await repo.ensure(repoName);
       githubUrl = remote.html_url || githubUrl;
-      const prepared = await sandbox.prepareGit(remote.clone_url, remote.token, true);
+      const prepared = await workspace.prepareGit(remote.clone_url, remote.token, true);
       step(jobUuid, "CODE", "repo-checkout", {
-        tool: "github+sandbox",
+        tool: "github+workspace",
         conclusion: `checked out ${repoName} rc=${prepared.returncode}`,
         output_query: githubUrl,
       });
@@ -195,14 +222,13 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   }
 
   if (executionMode === "run") {
-    const runResult = await sandbox.exec("python reproduce.py");
+    const runResult = await workspace.exec("python reproduce.py");
     step(jobUuid, "CODE", "run-existing-repo", {
-      tool: "sandbox",
+      tool: "workspace",
       conclusion: `rc=${runResult.returncode} ${runResult.stderr.slice(0, 160) || runResult.stdout.slice(0, 160)}`,
       output_query: "python reproduce.py",
     });
     output(jobUuid, "CODE", `existing repo run rc=${runResult.returncode}`, githubUrl);
-    sandbox.cleanup();
     return {
       code: {
         files: [],
@@ -222,7 +248,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   let checkpointContext = "";
   if (checkpoint) {
     for (const [path, content] of Object.entries(checkpoint)) {
-      sandbox.writeFile(path, content);
+      await workspace.writeFile(path, content);
       step(jobUuid, "CODE", "checkpoint-restore", {
         tool: "checkpoint",
         conclusion: `restored ${path} from checkpoint`,
@@ -239,7 +265,11 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     write_file: async (args: ToolArgs) => {
       const path = String(args["file_path"] ?? "");
       const content = String(args["content"] ?? "");
-      sandbox.writeFile(path, content);
+      try {
+        await workspace.writeFile(path, content);
+      } catch (e) {
+        return `Error writing ${path}: ${(e as Error).message}`;
+      }
       codeFiles.push({ path, contents: content });
       const allFiles: Record<string, string> = {};
       for (const f of codeFiles) allFiles[f.path] = f.contents;
@@ -249,7 +279,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     read_file: async (args: ToolArgs) => {
       const path = String(args["file_path"] ?? "");
       try {
-        return await sandbox.readFile(path);
+        return await workspace.readFile(path);
       } catch (e) {
         return `Error reading ${path}: ${(e as Error).message}`;
       }
@@ -257,7 +287,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     run_command: async (args: ToolArgs) => {
       const cmd = String(args["command"] ?? "");
       const timeout = Number(args["timeout"] ?? 120);
-      const r = await sandbox.exec(cmd, timeout);
+      const r = await workspace.exec(cmd, timeout);
       const log: RunLog = {
         step: `run-${accumulatedLogs.length + 1}`,
         stdout: r.stdout.slice(0, 3000),
@@ -268,7 +298,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     },
     list_files: async (args: ToolArgs) => {
       const directory = String(args["directory"] ?? ".");
-      return await sandbox.listFiles(directory);
+      return await workspace.listFiles(directory);
     },
     mark_implementation_complete: async (args: ToolArgs) => {
       data = args;
@@ -290,9 +320,9 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     });
   }
 
-  await runAgenticCall({
+  const result = await runAgentTurn({
     agentName: "CODE",
-    systemPrompt: CODE_SYSTEM_PROMPT,
+    systemPrompt: CODE_SYSTEM_PROMPT + (engine === "trueforge" ? CODE_TRUEFORGE_ADDENDUM : ""),
     userMessage,
     tools: CODE_TOOLS,
     toolHandlers: handlers,
@@ -300,7 +330,32 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     agentEnum: "CODE",
     maxTokens: s.AGENT_MAX_STEPS * 8192,
     conversationHistory,
+    engine,
   });
+  data = result.structured;
+
+  // trueForge engine: bridge the sandbox artifacts into the pipeline workspace
+  // so the files are persisted, checkpointed, and published exactly like
+  // locally-written files. Binary artifacts keep their raw bytes (no lossy
+  // UTF-8 round-trip); only text files go into the JSON checkpoint.
+  for (const f of result.sandboxFiles ?? []) {
+    try {
+      await workspace.writeFile(f.path, f.bytes ?? f.contents);
+      if (!codeFiles.some((cf) => cf.path === f.path)) {
+        codeFiles.push({ path: f.path, contents: f.bytes ? "" : f.contents });
+      }
+      if (!f.bytes) {
+        const allFiles: Record<string, string> = {};
+        for (const cf of codeFiles) if (cf.contents) allFiles[cf.path] = cf.contents;
+        saveCodeCheckpoint(userId, paperId, jobUuid, allFiles);
+      }
+    } catch (e) {
+      step(jobUuid, "CODE", "sandbox-bridge-write-failed", {
+        tool: "workspace",
+        conclusion: `could not write ${f.path}: ${(e as Error).message}`,
+      });
+    }
+  }
 
   if (codeFiles.length === 0) {
     pushError = "code produced no output";
@@ -308,7 +363,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
     const paths = new Set(codeFiles.map((f) => f.path));
     if (!paths.has("README.md")) {
       const readme = await generateReadme(state.arxiv_id ?? "", repoName, codeFiles);
-      sandbox.writeFile("README.md", readme);
+      await workspace.writeFile("README.md", readme);
       codeFiles.push({ path: "README.md", contents: readme });
       step(jobUuid, "CODE", "readme-injected", {
         tool: "llm:BYOK(OpenAI-compatible)",
@@ -321,13 +376,13 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
         const remote = await repo.ensure(repoName, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
         githubUrl = remote.html_url || githubUrl;
         if (!existing) {
-          const prepared = await sandbox.prepareGit(remote.clone_url, remote.token, false);
+          const prepared = await workspace.prepareGit(remote.clone_url, remote.token, false);
           if (prepared.returncode !== 0) pushError = prepared.stderr || prepared.stdout || "repo initialization failed";
         }
         if (!pushError) {
-          const pushed = await sandbox.publishGit(remote.token, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
+          const pushed = await workspace.publishGit(remote.token, `Polaris reproduction for arXiv ${state.arxiv_id ?? ""}`);
           step(jobUuid, "CODE", "repo-push", {
-            tool: "github+sandbox",
+            tool: "github+workspace",
             conclusion: `pushed ${repoName} rc=${pushed.returncode}`,
             output_query: githubUrl,
           });
@@ -336,7 +391,7 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
       } catch (e) {
         pushError = `repo publish failed: ${(e as Error).message}`;
         step(jobUuid, "CODE", "repo-push-failed", {
-          tool: "github+sandbox",
+          tool: "github+workspace",
           conclusion: pushError,
           output_query: githubUrl,
         });
@@ -345,14 +400,18 @@ export async function runCode(state: WorkerState): Promise<Partial<WorkerState>>
   }
 
   deleteCheckpoints(jobUuid);
-  sandbox.cleanup();
+
+  // A partial sandbox bridge (artifacts over the cap, or skipped/failed
+  // downloads) must surface as a run failure — publishing a repo that's
+  // missing required source/assets as a success would be worse than failing.
+  if (result.sandboxIncomplete && !pushError) pushError = result.sandboxIncomplete;
 
   const d = (data ?? {}) as Record<string, unknown>;
   const code: CodeOutput = {
     files: codeFiles,
     run_logs: accumulatedLogs,
     notes: String(d["summary"] ?? d["caveats"] ?? ""),
-    ready: data != null,
+    ready: data != null && codeFiles.length > 0,
     output_query: String(d["summary"] ?? "code produced output"),
     github_url: githubUrl,
     repo_name: repoName,

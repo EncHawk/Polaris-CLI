@@ -1,12 +1,20 @@
 {
   "name": "polaris-cli",
   "version": "0.1.0",
-  "description": "Polaris AI CLI — a BYOK agent harness that reproduces research papers, powered by trueForge.",
+  "description": "Polaris AI CLI — a BYOK agent harness that reproduces research papers, powered by trueForge. An MCP to access our agents for harness!",
   "module": "index.ts",
   "type": "module",
-  "private": true,
   "bin": {
     "polaris": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    ".env.example"
+  ],
+  "engines": {
+    "bun": ">=1.1.0"
   },
   "scripts": {
     "dev": "bun --hot ./index.ts",
@@ -21,15 +29,13 @@
     "@truefoundry/trueforge": "^0.1.4",
     "@truefoundry/trueforge-sdk": "^0.1.3",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "unpdf": "^1.8.1"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
-    "typescript": "^5"
-  },
-  "peerDependencies": {
     "typescript": "^5"
   }
 }

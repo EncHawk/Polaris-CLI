@@ -12,12 +12,14 @@
  */
 import { runTui } from "../server/tui.ts";
 import { startServer } from "../server/server.ts";
-import { createPolarisMcpServer } from "../mcp/server.ts";
+import { createPolarisMcpServer, mcpRouteHandler } from "../mcp/server.ts";
 import { getSettings } from "../config/settings.ts";
 import { makeTrueForgeClient } from "../trueforge/client.ts";
-import { isTrueForgeRunning } from "../trueforge/server.ts";
+import { isTrueForgeRunning, startTrueForgeServer, type TrueForgeServer } from "../trueforge/server.ts";
 import { provisionTrueForge } from "../trueforge/provision.ts";
 import { POLARIS_AGENT_NAMES, polarisAgentSpecs } from "../trueforge/agents.ts";
+import { extractPaperFile } from "../tools/upload.ts";
+import { parseEngine, type EngineType } from "../agents_util/engine.ts";
 
 const HELP = `Polaris AI CLI — BYOK paper-reproduction agent harness (powered by trueForge)
 
@@ -25,10 +27,15 @@ USAGE
   polaris <command> [args]
 
 COMMANDS
-  run <arxiv-id> [--auto] [--repo <name>] [--mode create|modify|run]
-                                  Run the pipeline (interactive TUI)
-  serve [--tf] [--port <n>]       Start agent-server (web + API + MCP)
-                                    --tf  also boot + provision trueForge
+  run <arxiv-id> [--auto] [--file <path>] [--engine local|trueforge]
+                     [--reuse] [--output <dir>] [--repo <name>] [--mode create|modify|run]
+                                   Run the pipeline (interactive TUI)
+                                     --file     read a PDF/markdown/tex file instead of fetching by arxiv id
+                                     --engine   local (BYOK ReAct loop, default) | trueforge (boots + provisions the harness)
+                                     --reuse    if an existing coded implementation is found in the library, reuse it
+                                     --output   directory to create the project in (default: cwd)
+  serve [--tf] [--port <n>]       Start agent-server (web + API + MCP + uploads)
+                                      --tf  also boot + provision trueForge
   mcp                             Run the polaris MCP server over stdio
   setup [--base-url <url>]        Provision a trueForge server (BYOK model + MCP + agents)
   agent list [--base-url <url>]   List trueForge agents
@@ -37,7 +44,10 @@ COMMANDS
 
 ENV  (see .env.example)
   POLARIS_API_KEY, POLARIS_BASE_URL, POLARIS_DEFAULT_MODEL  (BYOK LLM)
-  POLARIS_TRUEFORGE_PORT, POLARIS_TRUEFORGE_BASE_URL        (harness)
+  POLARIS_PAPERS_ORG, POLARIS_PUBLISH_ORG                   (library + publish targets)
+  POLARIS_PORT, POLARIS_MCP_PORT, POLARIS_TRUEFORGE_PORT    (ports)
+  POLARIS_MCP_PUBLIC_URL                                    (remote trueForge harness MCP URL)
+  POLARIS_MAX_UPLOAD_MB, POLARIS_MAX_PAPER_CHARS            (upload limits)
   GITHUB_ACCESS_TOKEN, DAYTONA_API_KEY                      (optional)
 `;
 
@@ -75,16 +85,193 @@ function hasFlag(rest: string[], name: string): boolean {
   return rest.includes(name);
 }
 
+/** Flags that consume the next token as their value. */
+const VALUE_FLAGS = new Set([
+  "--file",
+  "--engine",
+  "--output",
+  "--repo",
+  "--mode",
+  "--message",
+  "--base-url",
+  "--port",
+]);
+
+export interface ParsedArgs {
+  /** Free tokens that are neither flags nor flag values. */
+  positionals: string[];
+  values: Map<string, string>;
+  flags: Set<string>;
+}
+
+/**
+ * Parse CLI args so option VALUES (e.g. the path in `--file paper.pdf`) are
+ * never mistaken for the positional arXiv id.
+ */
+export function parseArgs(args: string[]): ParsedArgs {
+  const positionals: string[] = [];
+  const values = new Map<string, string>();
+  const flags = new Set<string>();
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (VALUE_FLAGS.has(a)) {
+      if (i + 1 >= args.length) throw new Error(`Missing value for ${a}`);
+      values.set(a, args[++i]!);
+    } else if (a.startsWith("-")) {
+      flags.add(a);
+    } else {
+      positionals.push(a);
+    }
+  }
+  return { positionals, values, flags };
+}
+
 async function cmdRun(rest: string[]): Promise<void> {
-  const arxivId = rest.find((a) => !a.startsWith("-"));
-  if (!arxivId) {
-    console.error("Usage: polaris run <arxiv-id> [--auto] [--repo <name>] [--mode create|modify|run]");
+  const { positionals, values, flags } = parseArgs(rest);
+  const arxivId = positionals[0];
+  const auto = flags.has("--auto");
+  const reuse = flags.has("--reuse");
+  const file = values.get("--file");
+  const output = values.get("--output");
+  const repo = values.get("--repo");
+  const mode = values.get("--mode");
+
+  let engine: EngineType;
+  try {
+    engine = parseEngine(values.get("--engine") ?? "local");
+  } catch (e) {
+    console.error(`${RED}${(e as Error).message}${RESET}`);
+    console.error("Usage: polaris run <arxiv-id> [--engine local|trueforge] [--auto] [--file <path>] [--reuse] [--output <dir>] [--repo <name>] [--mode create|modify|run]");
     process.exit(1);
   }
-  const auto = hasFlag(rest, "--auto");
-  const repo = flag(rest, "--repo");
-  const mode = flag(rest, "--mode");
-  await runTui({ arxiv_id: arxivId, repo_name: repo, execution_mode: mode, auto_approve: auto });
+
+  if (!arxivId && !file) {
+    console.error("Usage: polaris run <arxiv-id> [--auto] [--file <path>] [--engine local|trueforge] [--reuse] [--output <dir>] [--repo <name>] [--mode create|modify|run]");
+    process.exit(1);
+  }
+
+  // The trueForge engine needs a live harness + a reachable polaris MCP
+  // endpoint — boot/provision both before the pipeline starts, and tear them
+  // down afterwards.
+  const tfCleanup = engine === "trueforge" ? await ensureTrueForgeForRun() : null;
+
+  try {
+    let markdown: string | undefined;
+    let resolvedArxivId = arxivId;
+    if (file) {
+      console.log(`${DIM}Extracting text from ${file}…${RESET}`);
+      let result;
+      try {
+        result = await extractPaperFile(file);
+      } catch (e) {
+        console.error(`${RED}${(e as Error).message}${RESET}`);
+        process.exit(1);
+      }
+      markdown = result.markdown;
+      if (!resolvedArxivId && result.arxiv_id) resolvedArxivId = result.arxiv_id;
+      console.log(`${DIM}  ${result.kind} · ${result.pages} page(s) · ${result.chars} chars · arxiv ${result.arxiv_id || "(none)"}${RESET}`);
+      if (!markdown) {
+        console.error(`${RED}Could not extract text from ${file}${RESET}`);
+        process.exit(1);
+      }
+    }
+
+    await runTui({
+      arxiv_id: resolvedArxivId,
+      markdown,
+      engine,
+      reuse_if_exists: reuse,
+      output_dir: output,
+      repo_name: repo,
+      execution_mode: mode,
+      auto_approve: auto,
+    });
+  } finally {
+    tfCleanup?.();
+  }
+}
+
+/**
+ * Boot everything a `--engine trueforge` run needs:
+ *   - locally managed harness (default): start a standalone polaris MCP
+ *     endpoint + the harness itself (if not already running) + provisioning,
+ *   - remote harness (POLARIS_TRUEFORGE_BASE_URL): use it as provisioned, or
+ *     (re)provision with POLARIS_MCP_PUBLIC_URL when set — a localhost MCP
+ *     URL would resolve on the REMOTE host and be unreachable.
+ * Returns a cleanup function that tears down everything this helper started;
+ * on failure everything started so far is stopped before rethrowing.
+ */
+async function ensureTrueForgeForRun(): Promise<() => void> {
+  const s = getSettings();
+  if (!s.POLARIS_API_KEY) {
+    console.error(`${RED}--engine trueforge requires POLARIS_API_KEY (BYOK model provider)${RESET}`);
+    process.exit(1);
+  }
+
+  const baseUrl = s.TRUEFORGE_BASE_URL || `http://localhost:${s.TRUEFORGE_PORT}`;
+  const remote = !!s.TRUEFORGE_BASE_URL;
+
+  if (remote && !(await isTrueForgeRunning(baseUrl))) {
+    console.error(
+      `${RED}trueForge is not reachable at ${s.TRUEFORGE_BASE_URL}. ` +
+        `Start it (npx @truefoundry/trueforge) or unset POLARIS_TRUEFORGE_BASE_URL so polaris can boot one locally.${RESET}`,
+    );
+    process.exit(1);
+  }
+
+  const startMcpEndpoint = () =>
+    Bun.serve({
+      port: s.POLARIS_MCP_PORT,
+      // Loopback only: this endpoint exposes polaris_run (auto-approved CODE
+      // turns that execute shell commands) and auth is optional — binding all
+      // interfaces would let network peers drive code execution and burn the
+      // BYOK key. Remote harnesses reach it through the user's own
+      // proxy/tunnel in front of POLARIS_MCP_PUBLIC_URL.
+      hostname: "127.0.0.1",
+      routes: { "/mcp": mcpRouteHandler(Bun.env["POLARIS_MCP_SECRET"]) },
+      fetch: () => new Response("Not found", { status: 404 }),
+    });
+
+  let tfServer: TrueForgeServer | null = null;
+  let mcpServer: ReturnType<typeof Bun.serve> | null = null;
+
+  try {
+    if (remote) {
+      if (s.POLARIS_MCP_PUBLIC_URL) {
+        console.log(`${DIM}Starting local MCP endpoint (advertised as ${s.POLARIS_MCP_PUBLIC_URL}) …${RESET}`);
+        mcpServer = startMcpEndpoint();
+        console.log(`${DIM}Provisioning remote trueForge at ${baseUrl} …${RESET}`);
+        await provisionTrueForge(makeTrueForgeClient(baseUrl), {
+          mcpUrl: s.POLARIS_MCP_PUBLIC_URL,
+          mcpSecret: Bun.env["POLARIS_MCP_SECRET"],
+        });
+      } else {
+        console.log(
+          `${DIM}Using remote trueForge at ${baseUrl} as provisioned. ` +
+            `If its agents are missing polaris tools, set POLARIS_MCP_PUBLIC_URL to an externally reachable polaris MCP URL ` +
+            `and polaris will (re)provision it, or run: polaris setup --base-url ${baseUrl}${RESET}`,
+        );
+      }
+    } else {
+      const mcpUrl = `http://localhost:${s.POLARIS_MCP_PORT}/mcp`;
+      mcpServer = startMcpEndpoint();
+      if (!(await isTrueForgeRunning(baseUrl))) {
+        console.log(`${DIM}Starting local trueForge harness on ${baseUrl} …${RESET}`);
+        tfServer = await startTrueForgeServer();
+      }
+      console.log(`${DIM}Provisioning trueForge (BYOK model + polaris MCP → ${mcpUrl}) …${RESET}`);
+      await provisionTrueForge(makeTrueForgeClient(baseUrl), { mcpUrl, mcpSecret: Bun.env["POLARIS_MCP_SECRET"] });
+    }
+  } catch (e) {
+    tfServer?.stop();
+    mcpServer?.stop(true);
+    throw e;
+  }
+
+  return () => {
+    tfServer?.stop();
+    mcpServer?.stop(true);
+  };
 }
 
 async function cmdServe(rest: string[]): Promise<void> {
@@ -106,15 +293,13 @@ async function cmdMcp(rest: string[]): Promise<void> {
 
 async function cmdSetup(rest: string[]): Promise<void> {
   const s = getSettings();
-  const baseUrl = flag(rest, "--base-url") ?? s.TRUEFORGE_BASE_URL ?? `http://localhost:${s.TRUEFORGE_PORT}`;
+  const baseUrl = flag(rest, "--base-url") || s.TRUEFORGE_BASE_URL || `http://localhost:${s.TRUEFORGE_PORT}`;
   if (!(await isTrueForgeRunning(baseUrl))) {
     console.error(`trueForge is not running at ${baseUrl}. Start it with:\n  npx @truefoundry/trueforge`);
     process.exit(1);
   }
   const client = makeTrueForgeClient(baseUrl);
-  const mcpUrl = baseUrl.endsWith(":8790") || baseUrl.includes(":8791")
-    ? `${baseUrl}/mcp`
-    : `${baseUrl}/mcp`;
+  const mcpUrl = `${baseUrl.replace(/\/$/, "")}/mcp`;
   console.log(`Provisioning trueForge at ${baseUrl} …`);
   const result = await provisionTrueForge(client, { mcpUrl, mcpSecret: Bun.env["POLARIS_MCP_SECRET"] });
   console.log(`  ✓ model provider: ${result.providerName}`);
@@ -126,7 +311,8 @@ async function cmdSetup(rest: string[]): Promise<void> {
 async function cmdAgent(rest: string[]): Promise<void> {
   const [sub, ...subRest] = rest;
   const s = getSettings();
-  const baseUrl = flag(subRest, "--base-url") ?? s.TRUEFORGE_BASE_URL ?? `http://localhost:${s.TRUEFORGE_PORT}`;
+  const { positionals, values } = parseArgs(subRest);
+  const baseUrl = values.get("--base-url") || s.TRUEFORGE_BASE_URL || `http://localhost:${s.TRUEFORGE_PORT}`;
   const client = makeTrueForgeClient(baseUrl);
 
   if (sub === "list") {
@@ -139,8 +325,8 @@ async function cmdAgent(rest: string[]): Promise<void> {
   }
 
   if (sub === "run") {
-    const name = subRest.find((a) => !a.startsWith("-"));
-    const message = flag(subRest, "--message") ?? "Hello";
+    const name = positionals[0];
+    const message = values.get("--message") ?? "Hello";
     if (!name) {
       console.error("Usage: polaris agent run <name> [--message <text>]");
       process.exit(1);
@@ -185,17 +371,25 @@ async function cmdDoctor(rest: string[]): Promise<void> {
   const ghOk = !!s.GITHUB_ACCESS_TOKEN;
   console.log(`  ${ghOk ? GREEN + "✓" : YELLOW + "○"}${RESET} GitHub publishing ${DIM}(optional)${RESET}`);
 
-  // Daytona
-  const dayOk = !!s.DAYTONA_API_KEY;
-  console.log(`  ${dayOk ? GREEN + "✓" : YELLOW + "○"}${RESET} Daytona sandbox ${DIM}(optional, local tempdir fallback)${RESET}`);
+  // Output dir
+  const outDir = s.POLARIS_OUTPUT_DIR || process.cwd();
+  console.log(`  ${GREEN}✓${RESET} Output directory ${DIM}${outDir}${RESET}`);
 
   // trueForge
-  const tfBaseUrl = s.TRUEFORGE_BASE_URL ?? `http://localhost:${s.TRUEFORGE_PORT}`;
+  const tfBaseUrl = s.TRUEFORGE_BASE_URL || `http://localhost:${s.TRUEFORGE_PORT}`;
   const tfRunning = await isTrueForgeRunning(tfBaseUrl);
   console.log(`  ${tfRunning ? GREEN + "✓" : YELLOW + "○"}${RESET} trueForge at ${tfBaseUrl} ${DIM}(${tfRunning ? "running" : "not running — use `polaris serve --tf`"})${RESET}`);
 
   // MCP server
   console.log(`  ${GREEN}✓${RESET} MCP server available ${DIM}(polaris mcp / polaris serve)${RESET}`);
+
+  // Paper library
+  const papersOrg = s.POLARIS_PAPERS_ORG;
+  const papersAuth = s.POLARIS_PAPERS_TOKEN ? `${GREEN}✓${RESET}` : `${YELLOW}○${RESET}`;
+  console.log(`  ${papersAuth} Paper library ${DIM}github.com/${papersOrg} (search/get_polaris_implementation MCP tools)${RESET}`);
+  if (!s.POLARIS_PAPERS_TOKEN) {
+    console.log(`    ${DIM}anonymous GitHub rate-limited — set GITHUB_ACCESS_TOKEN for reliable library search${RESET}`);
+  }
 
   const allOk = llmOk;
   console.log(`\n  ${allOk ? GREEN + BOLD + "Ready." : RED + BOLD + "Missing BYOK LLM key — set POLARIS_API_KEY in .env"}${RESET}\n`);

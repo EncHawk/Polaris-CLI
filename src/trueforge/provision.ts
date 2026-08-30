@@ -57,7 +57,7 @@ export async function provisionTrueForge(client: TrueForge, opts: ProvisionOptio
       type: "remote",
       name: POLARIS_MCP_NAME,
       url: opts.mcpUrl,
-      description: "Polaris agent tools: completion signals, arxiv lookup, GitHub publishing.",
+      description: "Polaris agent tools: completion signals, arxiv lookup, paper-implementation library search/retrieval, GitHub publishing.",
       auth,
     },
   });

@@ -57,7 +57,8 @@ export async function runTui(job: Job): Promise<void> {
 
   console.log(`\n${BOLD}Polaris AI${RESET} ${DIM}— paper reproduction pipeline${RESET}\n`);
   console.log(`${DIM}Job: ${jobUuid}${RESET}`);
-  console.log(`${DIM}Paper: ${job.arxiv_id ?? "??"}${RESET}\n`);
+  console.log(`${DIM}Paper: ${job.arxiv_id ?? (job.markdown ? "uploaded file" : "??")}${RESET}`);
+  console.log(`${DIM}Engine: ${job.engine ?? "local"}${job.reuse_if_exists ? " · reuse-if-exists" : ""}${RESET}\n`);
 
   let approvalHandled = false;
 
