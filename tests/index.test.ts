@@ -60,6 +60,7 @@ test("approval gate awaits and resolves", async () => {
 });
 
 test("checkpoint save/load/delete round-trips locally", () => {
+  Bun.env["POLARIS_CHECKPOINT_DIR"] = `${Bun.env.TMPDIR ?? "/tmp"}/polaris-checkpoints-${crypto.randomUUID()}`;
   const { saveCodeCheckpoint, loadLatestCheckpoint, deleteCheckpoints } = require("../src/agents_util/checkpoint.ts");
   const job = `test-${crypto.randomUUID()}`;
   saveCodeCheckpoint("user", "paper", job, { "main.py": "print('hi')", "utils.py": "# helpers" });
@@ -72,7 +73,7 @@ test("checkpoint save/load/delete round-trips locally", () => {
 test("workspace writes and reads files on the real filesystem", async () => {
   const { Workspace } = await import("../src/tools/workspace.ts");
   const { rmSync } = await import("node:fs");
-  const tmp = `/tmp/polaris-test-${crypto.randomUUID()}`;
+  const tmp = `${Bun.env.TMPDIR ?? "/tmp"}/polaris-test-${crypto.randomUUID()}`;
   const ws = await Workspace.create("test-repo", tmp);
   expect(ws.workdir.includes("test-repo")).toBe(true);
   await ws.writeFile("hello.py", "print('world')");
@@ -253,7 +254,7 @@ test("Workspace refuses unowned non-empty dirs and confines file paths", async (
   const { Workspace } = await import("../src/tools/workspace.ts");
   const { mkdirSync, rmSync } = await import("node:fs");
   const { join } = await import("node:path");
-  const tmp = `/tmp/polaris-ws-${crypto.randomUUID()}`;
+  const tmp = `${Bun.env.TMPDIR ?? "/tmp"}/polaris-ws-${crypto.randomUUID()}`;
 
   // create mode refuses a pre-existing non-empty directory polaris doesn't own
   const foreign = join(tmp, "foreign");
@@ -272,7 +273,7 @@ test("Workspace refuses unowned non-empty dirs and confines file paths", async (
   // file operations cannot escape the workspace — including via `..` that a
   // naive join+prefix check would let through
   await expect(mine.writeFile("../escape.txt", "x")).rejects.toThrow(/escapes the workspace/);
-  await expect(mine.writeFile("/tmp/escape.txt", "x")).rejects.toThrow(/escapes the workspace/);
+  await expect(mine.writeFile(`${Bun.env.TMPDIR ?? "/tmp"}/escape.txt`, "x")).rejects.toThrow(/escapes the workspace/);
   await expect(mine.writeFile("a/../../escape.txt", "x")).rejects.toThrow(/escapes the workspace/);
   await expect(mine.readFile("../escape.txt")).rejects.toThrow(/escapes the workspace/);
 
